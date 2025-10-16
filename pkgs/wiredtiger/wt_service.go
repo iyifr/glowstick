@@ -2,7 +2,7 @@ package wiredtiger
 
 // Service provides a minimal API for interacting with WiredTiger.
 // This abstracts the underlying cgo implementation to allow testing and !cgo builds.
-type Service interface {
+type WTService interface {
 	Open(home string, config string) error
 	Close() error
 	CreateTable(name string, config string) error
@@ -24,8 +24,8 @@ type Service interface {
 }
 
 // New returns a Service implementation backed by cgo (when enabled).
-func New() Service {
-	return newService()
+func WiredTiger() WTService {
+	return WiredTigerService()
 }
 
 // KeyValuePair represents a string key/value row.

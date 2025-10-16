@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	wt "huedb/wiredtiger"
+	wt "glowstickdb/pkgs/wiredtiger"
 )
 
 func main() {

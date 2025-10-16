@@ -462,7 +462,7 @@ type cgoService struct {
 	conn *C.WT_CONNECTION
 }
 
-func newService() Service { return &cgoService{} }
+func WiredTigerService() WTService { return &cgoService{} }
 
 // ============================================================================
 // CONNECTION OPERATIONS
@@ -580,14 +580,25 @@ func (s *cgoService) Exists(table string, key string) (bool, error) {
 	return found == 1, nil
 }
 
+// Scan returns up to 4096 rows from the table, as before.
 func (s *cgoService) Scan(table string) ([]KeyValuePair, error) {
+	return s.ScanBatch(table, 0, 4096)
+}
+
+// ScanBatch enables batched scanning of results.
+// Offset is currently not implemented due to WiredTiger API limitations and is for API compatibility.
+// Limit sets the maximum number of results returned.
+func (s *cgoService) ScanBatch(table string, offset int, limit int) ([]KeyValuePair, error) {
 	if s.conn == nil {
 		return nil, errors.New("connection not open")
+	}
+	if limit <= 0 {
+		return []KeyValuePair{}, nil
 	}
 	curi := C.CString(table)
 	defer C.free(unsafe.Pointer(curi))
 	var vec C.wt_vec_t
-	err := C.wt_scan_collect(s.conn, curi, C.int(4096), &vec)
+	err := C.wt_scan_collect(s.conn, curi, C.int(limit), &vec)
 	if err != 0 {
 		return nil, fmt.Errorf("wiredtiger scan failed with error code %d", int(err))
 	}
