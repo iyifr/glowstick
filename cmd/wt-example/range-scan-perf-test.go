@@ -116,7 +116,7 @@ func RunDetailedRangeScanPerformanceTest() {
 			MemoryAllocated: int64(m2.Alloc - m1.Alloc),
 		}
 
-		fmt.Printf("%v (%d records, %dMB)\n", duration, len(pairs), fullScanResults[idx].MemoryAllocated/1024/1024)
+		fmt.Printf("%v (%d records, %dKB)\n", duration, len(pairs), fullScanResults[idx].MemoryAllocated/1024)
 
 		// Verify correctness
 		if len(pairs) != tr.expected {
@@ -189,7 +189,7 @@ func RunDetailedRangeScanPerformanceTest() {
 			MemoryAllocated: int64(m2.Alloc - m1.Alloc),
 		}
 
-		fmt.Printf("%v (%d records, %dMB)\n", duration, recordCount, rangeScanResults[idx].MemoryAllocated/1024/1024)
+		fmt.Printf("%v (%d records, %dKB)\n", duration, recordCount, rangeScanResults[idx].MemoryAllocated/1024)
 
 		// Verify correctness
 		if recordCount != tr.expected {
@@ -215,22 +215,22 @@ func RunDetailedRangeScanPerformanceTest() {
 	fmt.Println(string(bytes.Repeat([]byte("-"), 80)))
 
 	for idx := range testRanges {
-		fmt.Printf("%-30s | %12v | %10d | %10dMB\n",
+		fmt.Printf("%-30s | %12v | %10d | %10dKB\n",
 			fullScanResults[idx].Name,
 			fullScanResults[idx].Duration,
 			fullScanResults[idx].RecordsFound,
-			fullScanResults[idx].MemoryAllocated/1024/1024)
-		fmt.Printf("%-30s | %12v | %10d | %10dMB\n",
+			fullScanResults[idx].MemoryAllocated/1024)
+		fmt.Printf("%-30s | %12v | %10d | %10dKB\n",
 			rangeScanResults[idx].Name,
 			rangeScanResults[idx].Duration,
 			rangeScanResults[idx].RecordsFound,
-			rangeScanResults[idx].MemoryAllocated/1024/1024)
+			rangeScanResults[idx].MemoryAllocated/1024)
 		fmt.Println(string(bytes.Repeat([]byte("-"), 80)))
 	}
 
 	// Phase 3: Memory Efficiency Test
 	fmt.Println("\n=== Phase 3: Memory Efficiency (Constant Memory Test) ===")
-	fmt.Println("(Scanning increasing ranges, memory should remain constant)\n")
+	fmt.Println("(Scanning increasing ranges, memory should remain constant)")
 
 	memorySamples := make([]int64, 5)
 	recordSamples := make([]int, 5)
@@ -270,7 +270,7 @@ func RunDetailedRangeScanPerformanceTest() {
 		memorySamples[idx] = int64(m2.Alloc - m1.Alloc)
 		recordSamples[idx] = count
 
-		fmt.Printf("%d records, %dMB allocated\n", count, memorySamples[idx]/1024/1024)
+		fmt.Printf("%d records, %dKB allocated\n", count, memorySamples[idx]/1024)
 	}
 
 	// Analyze memory consistency
@@ -303,7 +303,7 @@ func RunDetailedRangeScanPerformanceTest() {
 	}
 
 	// Phase 4: Correctness Verification
-	fmt.Println("\n=== Phase 4: Correctness Verification ===\n")
+	fmt.Println("\n=== Phase 4: Correctness Verification ===")
 
 	testCases := []struct {
 		name          string
