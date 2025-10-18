@@ -450,6 +450,118 @@ static int wt_search_near_bin(WT_CONNECTION *conn, const char* uri,
     if (cerr != 0) return cerr;
     return err != 0 ? err : serr;
 }
+
+// ============================================================================
+// RANGE SCAN OPERATIONS (string keys)
+// ============================================================================
+
+typedef struct {
+    WT_SESSION *session;
+    WT_CURSOR *cursor;
+    char *end_key;   // malloc'd, for bounds
+    int   err;
+    int   closed;
+    int   valid;     // 1 if positioned at valid entry
+    int   in_bounds; // 1 if still in user range
+} wt_range_ctx_t;
+
+static wt_range_ctx_t* wt_range_scan_init_str(WT_CONNECTION *conn, const char* uri, const char* start_key, const char* end_key) {
+    wt_range_ctx_t *ctx = malloc(sizeof(wt_range_ctx_t));
+    if (!ctx) return NULL;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->err = 0; ctx->closed = 0; ctx->valid = 0; ctx->in_bounds = 1;
+    if (!conn || !uri || !start_key || !end_key) { free(ctx); return NULL; }
+    ctx->session = NULL;
+    ctx->cursor = NULL;
+    ctx->end_key = strdup(end_key);
+    // Open session
+    int err = conn->open_session(conn, NULL, NULL, &ctx->session);
+    if (err != 0 || !ctx->session) { free(ctx->end_key); free(ctx); return NULL; }
+    // Open cursor
+    err = ctx->session->open_cursor(ctx->session, uri, NULL, NULL, &ctx->cursor);
+    if (err != 0 || !ctx->cursor) {
+        ctx->session->close(ctx->session, NULL);
+        free(ctx->end_key); free(ctx); return NULL;
+    }
+    // Position at start_key (with search_near pattern)
+    ctx->cursor->set_key(ctx->cursor, start_key);
+    int exact = 0;
+    err = ctx->cursor->search_near(ctx->cursor, &exact);
+
+    if (err != 0 && err != WT_NOTFOUND) {
+        // Actual error
+        ctx->cursor->close(ctx->cursor);
+        ctx->session->close(ctx->session, NULL);
+        free(ctx->end_key); free(ctx); return NULL;
+    }
+
+    // If exact < 0, we're before the start key
+    // Call next() to position at the first key >= start_key
+    if (exact < 0) {
+        err = ctx->cursor->next(ctx->cursor);
+        if (err != 0 && err != WT_NOTFOUND) {
+            ctx->cursor->close(ctx->cursor);
+            ctx->session->close(ctx->session, NULL);
+            free(ctx->end_key); free(ctx); return NULL;
+        }
+    }
+
+    // Now cursor is positioned at:
+    // - exact match of start_key, OR
+    // - first key > start_key (if no exact match)
+    // Check bounds: current < end_key?
+    const char *curr;
+    if (ctx->cursor->get_key(ctx->cursor, &curr) == 0) {
+        if (strcmp(curr, ctx->end_key) >= 0) {
+            ctx->in_bounds = 0;
+            ctx->valid = 0;
+        } else {
+            ctx->in_bounds = 1;
+            ctx->valid = 1;
+        }
+    } else {
+        ctx->in_bounds = 0;
+        ctx->valid = 0;
+    }
+    return ctx;
+}
+
+static int wt_range_scan_next(wt_range_ctx_t* ctx, const char **out_key, const char **out_val, int* in_bounds) {
+    if (!ctx || ctx->closed) return -1;
+    int err = ctx->cursor->next(ctx->cursor);
+    if (err != 0) { ctx->valid = 0; ctx->in_bounds = 0; *in_bounds = 0; return err; }
+    const char *key = NULL; const char* val = NULL;
+    ctx->cursor->get_key(ctx->cursor, &key);
+    ctx->cursor->get_value(ctx->cursor, &val);
+    // Check bounds: key < end_key
+    if (strcmp(key, ctx->end_key) >= 0) {
+        ctx->in_bounds = 0;
+        ctx->valid = 0;
+        *in_bounds = 0;
+        return 1; // not an error, just OOB
+    }
+    ctx->in_bounds = 1; ctx->valid = 1;
+    *out_key = key;
+    *out_val = val;
+    *in_bounds = 1;
+    return 0;
+}
+
+// Retrieve current key/val (no iteration/movement)
+static int wt_range_scan_current(wt_range_ctx_t* ctx, const char **out_key, const char **out_val) {
+    if (!ctx || ctx->closed || !ctx->valid) return -1;
+    return ctx->cursor->get_key(ctx->cursor, out_key) == 0 && ctx->cursor->get_value(ctx->cursor, out_val) == 0 ? 0 : -1;
+}
+
+// Close/finalize & free ctx and internal resources
+static void wt_range_scan_close(wt_range_ctx_t* ctx) {
+    if (!ctx || ctx->closed) return;
+    if (ctx->cursor) ctx->cursor->close(ctx->cursor);
+    if (ctx->session) ctx->session->close(ctx->session, NULL);
+    if (ctx->end_key) free(ctx->end_key);
+    ctx->closed = 1;
+    free(ctx);
+}
 */
 import "C"
 import (
@@ -580,9 +692,14 @@ func (s *cgoService) Exists(table string, key string) (bool, error) {
 	return found == 1, nil
 }
 
-// Scan returns up to 4096 rows from the table, as before.
-func (s *cgoService) Scan(table string) ([]KeyValuePair, error) {
-	return s.ScanBatch(table, 0, 4096)
+// Scan returns up to a given threshold (default 4096 if threshold is 0 or less) rows from the table.
+// If threshold is provided as >0, use it. Otherwise, default to 4096.
+func (s *cgoService) Scan(table string, threshold ...int) ([]KeyValuePair, error) {
+	limit := 4096
+	if len(threshold) > 0 && threshold[0] > 0 {
+		limit = threshold[0]
+	}
+	return s.ScanBatch(table, 0, limit)
 }
 
 // ScanBatch enables batched scanning of results.
@@ -799,4 +916,103 @@ func (s *cgoService) GetBinaryWithStringKey(table string, stringKey string) ([]b
 func (s *cgoService) DeleteBinaryWithStringKey(table string, stringKey string) error {
 	keyBytes := []byte(stringKey)
 	return s.DeleteBinary(table, keyBytes)
+}
+
+// ============================================================================
+// RANGE SCAN OPERATIONS
+// ============================================================================
+
+type stringRangeCursor struct {
+	ctx       *C.wt_range_ctx_t
+	err       error
+	closed    bool
+	valid     bool
+	inBounds  bool
+	firstCall bool
+	currKey   string
+	currVal   string
+}
+
+func (c *stringRangeCursor) Next() bool {
+	if c.closed || c.err != nil || c.ctx == nil {
+		c.valid = false
+		return false
+	}
+
+	// On first call, cursor is already positioned at the first valid result
+	if c.firstCall {
+		c.firstCall = false
+		// Get current position without advancing
+		var ck, cv *C.char
+		errCode := C.wt_range_scan_current(c.ctx, &ck, &cv)
+		if errCode != 0 {
+			c.err = errors.New("range scan current failed")
+			c.valid = false
+			return false
+		}
+		c.currKey = C.GoString(ck)
+		c.currVal = C.GoString(cv)
+		c.valid = true
+		return true
+	}
+
+	// Subsequent calls: advance to next position
+	var ck, cv *C.char
+	var inBounds C.int
+	errCode := C.wt_range_scan_next(c.ctx, &ck, &cv, &inBounds)
+	if errCode != 0 && errCode != 1 { // 1 = not error, just OOB
+		c.err = errors.New("range scan next failed")
+		c.valid = false
+		return false
+	}
+	if inBounds == 0 {
+		c.valid = false
+		return false
+	}
+	c.currKey = C.GoString(ck)
+	c.currVal = C.GoString(cv)
+	c.valid = true
+	return true
+}
+
+func (c *stringRangeCursor) CurrentString() (string, string, error) {
+	if c.closed || c.ctx == nil || !c.valid {
+		return "", "", errors.New("cursor not positioned")
+	}
+	var ck, cv *C.char
+	errCode := C.wt_range_scan_current(c.ctx, &ck, &cv)
+	if errCode != 0 {
+		return "", "", errors.New("range scan current failed")
+	}
+	return C.GoString(ck), C.GoString(cv), nil
+}
+
+func (c *stringRangeCursor) Err() error { return c.err }
+func (c *stringRangeCursor) Close() error {
+	if c.closed || c.ctx == nil {
+		return nil
+	}
+	C.wt_range_scan_close(c.ctx)
+	c.closed = true
+	return nil
+}
+func (c *stringRangeCursor) Valid() bool { return c.valid }
+
+// ScanRange creates a cursor for iterating over string keys in the range [startKey, endKey)
+func (s *cgoService) ScanRange(table, startKey, endKey string) (StringRangeCursor, error) {
+	if s.conn == nil {
+		return nil, errors.New("connection not open")
+	}
+	ctable := C.CString(table)
+	cstart := C.CString(startKey)
+	cend := C.CString(endKey)
+	defer C.free(unsafe.Pointer(ctable))
+	defer C.free(unsafe.Pointer(cstart))
+	defer C.free(unsafe.Pointer(cend))
+	ctx := C.wt_range_scan_init_str(s.conn, ctable, cstart, cend)
+	if ctx == nil {
+		return nil, errors.New("failed to initialize string range scan")
+	}
+	out := &stringRangeCursor{ctx: ctx, valid: true, inBounds: true, firstCall: true}
+	return out, nil
 }

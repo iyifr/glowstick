@@ -10,7 +10,7 @@ type WTService interface {
 	GetString(table string, key string) (string, bool, error)
 	DeleteString(table string, key string) error
 	Exists(table string, key string) (bool, error)
-	Scan(table string) ([]KeyValuePair, error)
+	Scan(table string, threshold ...int) ([]KeyValuePair, error)
 	SearchNear(table string, probeKey string) (string, string, int, bool, error)
 	PutBinary(table string, key []byte, value []byte) error
 	GetBinary(table string, key []byte) ([]byte, bool, error)
@@ -21,6 +21,7 @@ type WTService interface {
 	PutBinaryWithStringKey(table string, stringKey string, value []byte) error
 	GetBinaryWithStringKey(table string, stringKey string) ([]byte, bool, error)
 	DeleteBinaryWithStringKey(table string, stringKey string) error
+	ScanRange(table string, startKey string, endKey string) (StringRangeCursor, error)
 }
 
 // New returns a Service implementation backed by cgo (when enabled).
@@ -36,4 +37,13 @@ type KeyValuePair struct {
 type BinaryKeyValuePair struct {
 	Key   []byte
 	Value []byte
+}
+
+// StringRangeCursor provides cursor-based range iteration for string keys
+type StringRangeCursor interface {
+	Next() bool                             // Iterate forward
+	CurrentString() (string, string, error) // Get key, value
+	Err() error
+	Close() error
+	Valid() bool
 }
