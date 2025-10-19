@@ -487,36 +487,43 @@ static wt_range_ctx_t* wt_range_scan_init_str(WT_CONNECTION *conn, const char* u
 
     int exact = 0;
     err = ctx->cursor->search_near(ctx->cursor, &exact);
-
+    printf("%d\n", exact);
     switch (exact) {
     case -1: {
         // search_near landed before start_key; advance to first key > start_key
-        int err_next = ctx->cursor->next(ctx->cursor);
-        if (err_next != 0) {
-            // No key found greater than start_key; clean up and return NULL
+        printf("range_scan_init_str: search_near result -1, calling reset+next to first real key...\n");
+        int err_reset = ctx->cursor->reset(ctx->cursor);
+        if (err_reset != 0) {
+            printf("range_scan_init_str: reset failed, err=%d\n", err_reset);
             ctx->cursor->close(ctx->cursor);
             ctx->session->close(ctx->session, NULL);
-            free(ctx->end_key); free(ctx); return NULL;
+            free(ctx->end_key); free(ctx);
+            return NULL;
         }
-        // Check bounds: current < end_key?
-        const char *curr;
+        // After reset, must call next() and check bounds
+        int err_next = ctx->cursor->next(ctx->cursor);
+        if (err_next != 0) {
+            printf("range_scan_init_str: next after reset failed, no valid key (err=%d)\n", err_next);
+            ctx->in_range = 0;
+            ctx->valid = 0;
+            // Still return ctx so caller sees empty range, not NULL/fatal
+            return ctx;
+        }
+        // Check bounds: key < end_key?
+        const char *curr = NULL;
         if (ctx->cursor->get_key(ctx->cursor, &curr) == 0) {
             if (strcmp(curr, ctx->end_key) >= 0) {
                 ctx->in_range = 0;
                 ctx->valid = 0;
-            } else if (strcmp(curr, start_key) > 0) {
-                // Valid: first key strictly greater than start_key
+            } else {
                 ctx->in_range = 1;
                 ctx->valid = 1;
-            } else {
-                // Defensive: somehow still not beyond start_key
-                ctx->in_range = 0;
-                ctx->valid = 0;
             }
         } else {
             ctx->in_range = 0;
             ctx->valid = 0;
         }
+        printf("range_scan_init_str: after reset+next, valid=%d, in_range=%d\n", ctx->valid, ctx->in_range);
         return ctx;
     }
 

@@ -1,6 +1,6 @@
 package main
 
 func main() {
-	RunRangeScanExample()
-	//RunDetailedRangeScanPerformanceTest()
+	//RunRangeScanExample()
+	RunDetailedRangeScanPerformanceTest()
 }

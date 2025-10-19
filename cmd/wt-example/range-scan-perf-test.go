@@ -341,7 +341,7 @@ func RunDetailedRangeScanPerformanceTest() {
 
 		cursor, err := wtService.ScanRange(uri, tc.start, tc.end)
 		if err != nil {
-			fmt.Printf("  SKIPPED (not implemented)\n\n")
+			fmt.Printf("  SKIPPED (not implemented): %v\n\n", err)
 			continue
 		}
 
