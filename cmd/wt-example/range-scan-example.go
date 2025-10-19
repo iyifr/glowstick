@@ -70,7 +70,7 @@ func RunRangeScanExample() {
 	fmt.Println("\n=== Example 1: Simple Range Query ===")
 	fmt.Println("Finding all fruits from 'c' to 'm':")
 
-	cursor, err := wtService.ScanRange(uri, "c", "m")
+	cursor, err := wtService.ScanRange(uri, "c", "q")
 	if err != nil {
 		log.Fatal("Failed to create range cursor:", err)
 	}

@@ -458,18 +458,17 @@ static int wt_search_near_bin(WT_CONNECTION *conn, const char* uri,
 typedef struct {
     WT_SESSION *session;
     WT_CURSOR *cursor;
-    char *end_key;   // malloc'd, for bounds
     int   err;
-    int   closed;
     int   valid;     // 1 if positioned at valid entry
-    int   in_bounds; // 1 if still in user range
+    int   in_range; // 1 if still in user range
+    char *end_key;   // malloc'd, for bounds
 } wt_range_ctx_t;
 
 static wt_range_ctx_t* wt_range_scan_init_str(WT_CONNECTION *conn, const char* uri, const char* start_key, const char* end_key) {
     wt_range_ctx_t *ctx = malloc(sizeof(wt_range_ctx_t));
     if (!ctx) return NULL;
     memset(ctx, 0, sizeof(*ctx));
-    ctx->err = 0; ctx->closed = 0; ctx->valid = 0; ctx->in_bounds = 1;
+    ctx->err = 0; ctx->valid = 0; ctx->in_range = 1;
     if (!conn || !uri || !start_key || !end_key) { free(ctx); return NULL; }
     ctx->session = NULL;
     ctx->cursor = NULL;
@@ -485,86 +484,301 @@ static wt_range_ctx_t* wt_range_scan_init_str(WT_CONNECTION *conn, const char* u
     }
     // Position at start_key (with search_near pattern)
     ctx->cursor->set_key(ctx->cursor, start_key);
+
     int exact = 0;
     err = ctx->cursor->search_near(ctx->cursor, &exact);
 
-    if (err != 0 && err != WT_NOTFOUND) {
-        // Actual error
-        ctx->cursor->close(ctx->cursor);
-        ctx->session->close(ctx->session, NULL);
-        free(ctx->end_key); free(ctx); return NULL;
-    }
-
-    // If exact < 0, we're before the start key
-    // Call next() to position at the first key >= start_key
-    if (exact < 0) {
-        err = ctx->cursor->next(ctx->cursor);
-        if (err != 0 && err != WT_NOTFOUND) {
+    switch (exact) {
+    case -1: {
+        // search_near landed before start_key; advance to first key > start_key
+        int err_next = ctx->cursor->next(ctx->cursor);
+        if (err_next != 0) {
+            // No key found greater than start_key; clean up and return NULL
             ctx->cursor->close(ctx->cursor);
             ctx->session->close(ctx->session, NULL);
             free(ctx->end_key); free(ctx); return NULL;
         }
+        // Check bounds: current < end_key?
+        const char *curr;
+        if (ctx->cursor->get_key(ctx->cursor, &curr) == 0) {
+            if (strcmp(curr, ctx->end_key) >= 0) {
+                ctx->in_range = 0;
+                ctx->valid = 0;
+            } else if (strcmp(curr, start_key) > 0) {
+                // Valid: first key strictly greater than start_key
+                ctx->in_range = 1;
+                ctx->valid = 1;
+            } else {
+                // Defensive: somehow still not beyond start_key
+                ctx->in_range = 0;
+                ctx->valid = 0;
+            }
+        } else {
+            ctx->in_range = 0;
+            ctx->valid = 0;
+        }
+        return ctx;
     }
 
-    // Now cursor is positioned at:
-    // - exact match of start_key, OR
-    // - first key > start_key (if no exact match)
-    // Check bounds: current < end_key?
-    const char *curr;
-    if (ctx->cursor->get_key(ctx->cursor, &curr) == 0) {
-        if (strcmp(curr, ctx->end_key) >= 0) {
-            ctx->in_bounds = 0;
-            ctx->valid = 0;
+    case 0:
+    case 1: {
+
+        // Now cursor is positioned at:
+        // - exact match of start_key, OR
+        // - first key > start_key (if no exact match)
+        // Check bounds: current < end_key?
+        const char *curr;
+        if (ctx->cursor->get_key(ctx->cursor, &curr) == 0) {
+            if (strcmp(curr, ctx->end_key) >= 0) {
+                ctx->in_range = 0;
+                ctx->valid = 0;
+            } else {
+                ctx->in_range = 1;
+                ctx->valid = 1;
+            }
         } else {
-            ctx->in_bounds = 1;
-            ctx->valid = 1;
+            // Set BOOLS to false
+            ctx->in_range = 0;
+            ctx->valid = 0;
         }
-    } else {
-        ctx->in_bounds = 0;
-        ctx->valid = 0;
+        return ctx;
     }
-    return ctx;
+    }
+    ctx->cursor->close(ctx->cursor);
+    ctx->session->close(ctx->session, NULL);
+    free(ctx->end_key);
+    free(ctx);
+    return NULL;
 }
 
-static int wt_range_scan_next(wt_range_ctx_t* ctx, const char **out_key, const char **out_val, int* in_bounds) {
-    if (!ctx || ctx->closed) return -1;
+
+static int wt_range_scan_next(wt_range_ctx_t* ctx, const char **out_key, const char **out_val, int* in_range) {
+    if (!ctx) return -1;
     int err = ctx->cursor->next(ctx->cursor);
-    if (err != 0) { ctx->valid = 0; ctx->in_bounds = 0; *in_bounds = 0; return err; }
+    if (err != 0) { ctx->valid = 0; ctx->in_range = 0; *in_range = 0; return err; }
     const char *key = NULL; const char* val = NULL;
     ctx->cursor->get_key(ctx->cursor, &key);
     ctx->cursor->get_value(ctx->cursor, &val);
     // Check bounds: key < end_key
     if (strcmp(key, ctx->end_key) >= 0) {
-        ctx->in_bounds = 0;
+        ctx->in_range = 0;
         ctx->valid = 0;
-        *in_bounds = 0;
+        *in_range = 0;
         return 1; // not an error, just OOB
     }
-    ctx->in_bounds = 1; ctx->valid = 1;
+    ctx->in_range = 1; ctx->valid = 1;
     *out_key = key;
     *out_val = val;
-    *in_bounds = 1;
+    *in_range = 1;
     return 0;
 }
 
 // Retrieve current key/val (no iteration/movement)
 static int wt_range_scan_current(wt_range_ctx_t* ctx, const char **out_key, const char **out_val) {
-    if (!ctx || ctx->closed || !ctx->valid) return -1;
+    if (!ctx  || !ctx->valid) return -1;
     return ctx->cursor->get_key(ctx->cursor, out_key) == 0 && ctx->cursor->get_value(ctx->cursor, out_val) == 0 ? 0 : -1;
 }
 
 // Close/finalize & free ctx and internal resources
 static void wt_range_scan_close(wt_range_ctx_t* ctx) {
-    if (!ctx || ctx->closed) return;
+    if (!ctx) return;
     if (ctx->cursor) ctx->cursor->close(ctx->cursor);
     if (ctx->session) ctx->session->close(ctx->session, NULL);
     if (ctx->end_key) free(ctx->end_key);
-    ctx->closed = 1;
     free(ctx);
 }
+
+// ============================================================================
+// BATCH RANGE SCAN OPERATIONS (string keys)
+// ============================================================================
+
+// Batch buffer structure for efficient data transfer
+typedef struct {
+    char *data;        // Packed key-value data
+    size_t capacity;  // Total allocated capacity
+    size_t length;    // Current data length
+    size_t count;     // Number of records in buffer
+} wt_batch_buf_t;
+
+// Initialize batch buffer with initial capacity
+static wt_batch_buf_t* wt_batch_buf_init(size_t initial_capacity) {
+    wt_batch_buf_t *buf = malloc(sizeof(wt_batch_buf_t));
+    if (!buf) return NULL;
+
+    buf->data = malloc(initial_capacity);
+    if (!buf->data) {
+        free(buf);
+        return NULL;
+    }
+
+    buf->capacity = initial_capacity;
+    buf->length = 0;
+    buf->count = 0;
+    return buf;
+}
+
+// Ensure buffer has enough capacity for additional data
+static int wt_batch_buf_ensure_capacity(wt_batch_buf_t *buf, size_t needed) {
+    if (!buf) return -1;
+
+    if (buf->length + needed <= buf->capacity) {
+        return 0; // Already has enough capacity
+    }
+
+    // Double capacity strategy for amortized O(1) growth
+    size_t new_capacity = buf->capacity * 2;
+    while (new_capacity < buf->length + needed) {
+        new_capacity *= 2;
+    }
+
+    char *new_data = realloc(buf->data, new_capacity);
+    if (!new_data) return -1;
+
+    buf->data = new_data;
+    buf->capacity = new_capacity;
+    return 0;
+}
+
+// Append a key-value pair to the batch buffer
+// Format: [key_len (4 bytes)][key_data][val_len (4 bytes)][val_data]
+static int wt_batch_buf_append_kv(wt_batch_buf_t *buf, const char *key, const char *val) {
+    if (!buf || !key || !val) return -1;
+
+    size_t key_len = strlen(key);
+    size_t val_len = strlen(val);
+    size_t total_needed = 4 + key_len + 4 + val_len; // lengths + data
+
+    if (wt_batch_buf_ensure_capacity(buf, total_needed) != 0) {
+        return -1;
+    }
+
+    char *ptr = buf->data + buf->length;
+
+    // Write key length (little-endian uint32)
+    uint32_t key_len_le = (uint32_t)key_len;
+    memcpy(ptr, &key_len_le, 4);
+    ptr += 4;
+
+    // Write key data
+    memcpy(ptr, key, key_len);
+    ptr += key_len;
+
+    // Write value length (little-endian uint32)
+    uint32_t val_len_le = (uint32_t)val_len;
+    memcpy(ptr, &val_len_le, 4);
+    ptr += 4;
+
+    // Write value data
+    memcpy(ptr, val, val_len);
+    ptr += val_len;
+
+    buf->length = ptr - buf->data;
+    buf->count++;
+    return 0;
+}
+
+// Free batch buffer and all associated memory
+static void wt_batch_buf_free(wt_batch_buf_t *buf) {
+    if (!buf) return;
+    if (buf->data) free(buf->data);
+    free(buf);
+}
+
+// High-performance batch range scan implementation
+// Fetches up to max_records key-value pairs in a single operation
+static int wt_range_scan_next_batch(wt_range_ctx_t* ctx, int max_records,
+                                   char **out_buf, int *out_buf_len, int *out_count) {
+    if (!ctx || !out_buf || !out_buf_len || !out_count) {
+        return -1;
+    }
+
+    // Initialize output parameters
+    *out_buf = NULL;
+    *out_buf_len = 0;
+    *out_count = 0;
+
+    // If cursor is not valid or out of range, return empty batch
+    if (!ctx->valid || !ctx->in_range) {
+        return 0; // Success, but empty batch
+    }
+
+    // Initialize batch buffer with reasonable initial capacity
+    // Estimate: average 50 chars per key + 100 chars per value = ~150 bytes per record
+    size_t estimated_size = max_records * 150;
+    wt_batch_buf_t *batch_buf = wt_batch_buf_init(estimated_size);
+    if (!batch_buf) {
+        return -1; // Memory allocation failed
+    }
+
+    int records_fetched = 0;
+    int err = 0;
+
+    // Fetch records in batch
+    for (int i = 0; i < max_records; i++) {
+        const char *key = NULL;
+        const char *val = NULL;
+
+        // Get current key-value pair
+        err = ctx->cursor->get_key(ctx->cursor, &key);
+        if (err != 0) break;
+
+        err = ctx->cursor->get_value(ctx->cursor, &val);
+        if (err != 0) break;
+
+        // Check bounds: key < end_key
+        if (strcmp(key, ctx->end_key) >= 0) {
+            ctx->in_range = 0;
+            ctx->valid = 0;
+            break; // Out of range, but not an error
+        }
+
+        // Append to batch buffer
+        if (wt_batch_buf_append_kv(batch_buf, key, val) != 0) {
+            err = -1;
+            break;
+        }
+
+        records_fetched++;
+
+        // Advance to next record
+        err = ctx->cursor->next(ctx->cursor);
+        if (err != 0) {
+            // If we got some records before hitting an error, that's still success
+            if (records_fetched > 0) {
+                err = 0; // Treat as success with partial batch
+            }
+            break;
+        }
+    }
+
+    // Set output parameters
+    if (records_fetched > 0) {
+        *out_buf = batch_buf->data;
+        *out_buf_len = (int)batch_buf->length;
+        *out_count = records_fetched;
+
+        // Transfer ownership of data buffer to caller
+        // Don't free batch_buf->data here - it will be freed by wt_free_batch_buf
+        batch_buf->data = NULL; // Prevent double-free
+    }
+
+    // Always free the batch buffer struct
+    wt_batch_buf_free(batch_buf);
+
+    return err;
+}
+
+// Free a batch buffer returned by wt_range_scan_next_batch
+static void wt_free_batch_buf(char *buf) {
+    if (buf) {
+        free(buf);
+    }
+}
+
 */
 import "C"
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"unsafe"
@@ -921,16 +1135,22 @@ func (s *cgoService) DeleteBinaryWithStringKey(table string, stringKey string) e
 // ============================================================================
 // RANGE SCAN OPERATIONS
 // ============================================================================
-
 type stringRangeCursor struct {
 	ctx       *C.wt_range_ctx_t
 	err       error
 	closed    bool
 	valid     bool
-	inBounds  bool
 	firstCall bool
-	currKey   string
-	currVal   string
+
+	// batchBuffer holds a batch of key-value pairs from the C layer.
+	// The format is [key1_len (u32)][key1_data][val1_len (u32)][val1_data]...
+	batchBuffer []byte
+	// readOffset is the current reading position in batchBuffer.
+	readOffset int
+
+	// Current key and value parsed from the batch.
+	currKey string
+	currVal string
 }
 
 func (c *stringRangeCursor) Next() bool {
@@ -939,52 +1159,102 @@ func (c *stringRangeCursor) Next() bool {
 		return false
 	}
 
-	// On first call, cursor is already positioned at the first valid result
-	if c.firstCall {
-		c.firstCall = false
-		// Get current position without advancing
-		var ck, cv *C.char
-		errCode := C.wt_range_scan_current(c.ctx, &ck, &cv)
-		if errCode != 0 {
-			c.err = errors.New("range scan current failed")
+	// If the buffer is fully read, fetch the next batch.
+	if c.readOffset >= len(c.batchBuffer) {
+		if err := c.fetchNextBatch(); err != nil {
+			c.err = err
 			c.valid = false
 			return false
 		}
-		c.currKey = C.GoString(ck)
-		c.currVal = C.GoString(cv)
-		c.valid = true
-		return true
+		// If the new batch is empty, we're done.
+		if len(c.batchBuffer) == 0 {
+			c.valid = false
+			return false
+		}
 	}
 
-	// Subsequent calls: advance to next position
-	var ck, cv *C.char
-	var inBounds C.int
-	errCode := C.wt_range_scan_next(c.ctx, &ck, &cv, &inBounds)
-	if errCode != 0 && errCode != 1 { // 1 = not error, just OOB
-		c.err = errors.New("range scan next failed")
+	// Read the next key-value pair from the batch buffer.
+	// Each entry is length-prefixed.
+	if err := c.readNextKV(); err != nil {
+		c.err = err
 		c.valid = false
 		return false
 	}
-	if inBounds == 0 {
-		c.valid = false
-		return false
-	}
-	c.currKey = C.GoString(ck)
-	c.currVal = C.GoString(cv)
+
 	c.valid = true
 	return true
 }
 
-func (c *stringRangeCursor) CurrentString() (string, string, error) {
-	if c.closed || c.ctx == nil || !c.valid {
-		return "", "", errors.New("cursor not positioned")
-	}
-	var ck, cv *C.char
-	errCode := C.wt_range_scan_current(c.ctx, &ck, &cv)
+// fetchNextBatch retrieves the next chunk of key-value pairs from C.
+func (c *stringRangeCursor) fetchNextBatch() error {
+	const batchSize = 1000 // Number of records to fetch per batch.
+	var cBuf *C.char
+	var cBufLen C.int
+	var numFetched C.int
+
+	errCode := C.wt_range_scan_next_batch(c.ctx, batchSize, &cBuf, &cBufLen, &numFetched)
 	if errCode != 0 {
-		return "", "", errors.New("range scan current failed")
+		return errors.New("range scan fetchNextBatch failed")
 	}
-	return C.GoString(ck), C.GoString(cv), nil
+	defer C.wt_free_batch_buf(cBuf) // Free the C buffer after copying.
+
+	if numFetched == 0 {
+		c.batchBuffer = nil
+		c.readOffset = 0
+		return nil
+	}
+
+	// Copy the data from C memory to a Go-managed byte slice.
+	c.batchBuffer = C.GoBytes(unsafe.Pointer(cBuf), cBufLen)
+	c.readOffset = 0
+	return nil
+}
+
+// readNextKV parses the next key and value from the batchBuffer.
+func (c *stringRangeCursor) readNextKV() error {
+	buf := c.batchBuffer
+	offset := c.readOffset
+
+	// Ensure there's enough data for key length.
+	if len(buf)-offset < 4 {
+		return errors.New("incomplete batch: could not read key length")
+	}
+	keyLen := int(binary.LittleEndian.Uint32(buf[offset:]))
+	offset += 4
+
+	// Ensure there's enough data for the key.
+	if len(buf)-offset < keyLen {
+		return errors.New("incomplete batch: could not read key")
+	}
+	c.currKey = string(buf[offset : offset+keyLen])
+	offset += keyLen
+
+	// Ensure there's enough data for value length.
+	if len(buf)-offset < 4 {
+		return errors.New("incomplete batch: could not read value length")
+	}
+	valLen := int(binary.LittleEndian.Uint32(buf[offset:]))
+	offset += 4
+
+	// Ensure there's enough data for the value.
+	if len(buf)-offset < valLen {
+		return errors.New("incomplete batch: could not read value")
+	}
+	c.currVal = string(buf[offset : offset+valLen])
+	offset += valLen
+
+	c.readOffset = offset
+	return nil
+}
+
+func (c *stringRangeCursor) CurrentString() (string, string, error) {
+	if !c.valid {
+		return "", "", errors.New("cursor not positioned on a valid record")
+	}
+	if c.err != nil {
+		return "", "", c.err
+	}
+	return c.currKey, c.currVal, nil
 }
 
 func (c *stringRangeCursor) Err() error { return c.err }
@@ -1013,6 +1283,14 @@ func (s *cgoService) ScanRange(table, startKey, endKey string) (StringRangeCurso
 	if ctx == nil {
 		return nil, errors.New("failed to initialize string range scan")
 	}
-	out := &stringRangeCursor{ctx: ctx, valid: true, inBounds: true, firstCall: true}
+	out := &stringRangeCursor{
+		ctx:         ctx,
+		valid:       true,
+		firstCall:   true,
+		batchBuffer: nil,
+		readOffset:  0,
+		currKey:     "",
+		currVal:     "",
+	}
 	return out, nil
 }
