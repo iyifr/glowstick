@@ -11,6 +11,7 @@ package wiredtiger
 #include <stdlib.h>
 #include <string.h>
 #include <wiredtiger.h>
+#include <stdio.h>
 
 // ============================================================================
 // CONNECTION OPERATIONS
@@ -358,21 +359,21 @@ static int wt_scan_bin_collect(WT_CONNECTION *conn, const char* uri, int max, wt
     if (err != 0) goto done;
     if (!cursor) { err = -1; goto done; }
 
-    WT_ITEM *k; WT_ITEM *v;
+    WT_ITEM k; WT_ITEM v;
     while ((err = cursor->next(cursor)) == 0) {
         if (cursor->get_key(cursor, &k) != 0) { err = -1; break; }
         if (cursor->get_value(cursor, &v) != 0) { err = -1; break; }
         if (out->len >= max) break;
 
-        out->keys[out->len] = (unsigned char*)malloc(k->size);
+        out->keys[out->len] = (unsigned char*)malloc(k.size);
         if (!out->keys[out->len]) { err = -1; break; }
-        memcpy(out->keys[out->len], k->data, k->size);
-        out->key_lens[out->len] = k->size;
+        memcpy(out->keys[out->len], k.data, k.size);
+        out->key_lens[out->len] = k.size;
 
-        out->vals[out->len] = (unsigned char*)malloc(v->size);
+        out->vals[out->len] = (unsigned char*)malloc(v.size);
         if (!out->vals[out->len]) { err = -1; break; }
-        memcpy(out->vals[out->len], v->data, v->size);
-        out->val_lens[out->len] = v->size;
+        memcpy(out->vals[out->len], v.data, v.size);
+        out->val_lens[out->len] = v.size;
 
         out->len++;
     }
@@ -430,17 +431,17 @@ static int wt_search_near_bin(WT_CONNECTION *conn, const char* uri,
 
     err = cursor->search_near(cursor, exact);
     if (err == 0) {
-        WT_ITEM *k; WT_ITEM *v;
+        WT_ITEM k; WT_ITEM v;
         if (cursor->get_key(cursor, &k) == 0 && cursor->get_value(cursor, &v) == 0) {
-            outKey->data = malloc(k->size);
+            outKey->data = malloc(k.size);
             if (outKey->data) {
-                memcpy(outKey->data, k->data, k->size);
-                outKey->size = k->size;
+                memcpy(outKey->data, k.data, k.size);
+                outKey->size = k.size;
             }
-            outVal->data = malloc(v->size);
+            outVal->data = malloc(v.size);
             if (outVal->data) {
-                memcpy(outVal->data, v->data, v->size);
-                outVal->size = v->size;
+                memcpy(outVal->data, v.data, v.size);
+                outVal->size = v.size;
             }
         }
     }
@@ -480,21 +481,19 @@ static wt_range_ctx_t* wt_range_scan_init_str(WT_CONNECTION *conn, const char* u
     err = ctx->session->open_cursor(ctx->session, uri, NULL, NULL, &ctx->cursor);
     if (err != 0 || !ctx->cursor) {
         ctx->session->close(ctx->session, NULL);
-        free(ctx->end_key); free(ctx); return NULL;
+        free(ctx->end_key); free(ctx);
+        return NULL;
     }
     // Position at start_key (with search_near pattern)
     ctx->cursor->set_key(ctx->cursor, start_key);
 
     int exact = 0;
     err = ctx->cursor->search_near(ctx->cursor, &exact);
-    printf("%d\n", exact);
     switch (exact) {
     case -1: {
         // search_near landed before start_key; advance to first key > start_key
-        printf("range_scan_init_str: search_near result -1, calling reset+next to first real key...\n");
         int err_reset = ctx->cursor->reset(ctx->cursor);
         if (err_reset != 0) {
-            printf("range_scan_init_str: reset failed, err=%d\n", err_reset);
             ctx->cursor->close(ctx->cursor);
             ctx->session->close(ctx->session, NULL);
             free(ctx->end_key); free(ctx);
@@ -503,7 +502,6 @@ static wt_range_ctx_t* wt_range_scan_init_str(WT_CONNECTION *conn, const char* u
         // After reset, must call next() and check bounds
         int err_next = ctx->cursor->next(ctx->cursor);
         if (err_next != 0) {
-            printf("range_scan_init_str: next after reset failed, no valid key (err=%d)\n", err_next);
             ctx->in_range = 0;
             ctx->valid = 0;
             // Still return ctx so caller sees empty range, not NULL/fatal
@@ -523,7 +521,6 @@ static wt_range_ctx_t* wt_range_scan_init_str(WT_CONNECTION *conn, const char* u
             ctx->in_range = 0;
             ctx->valid = 0;
         }
-        printf("range_scan_init_str: after reset+next, valid=%d, in_range=%d\n", ctx->valid, ctx->in_range);
         return ctx;
     }
 
@@ -781,6 +778,301 @@ static void wt_free_batch_buf(char *buf) {
         free(buf);
     }
 }
+
+// ============================================================================
+// RANGE SCAN OPERATIONS (binary keys)
+// ============================================================================
+
+typedef struct {
+    WT_SESSION *session;
+    WT_CURSOR  *cursor;
+    int         err;
+    int         valid;      // 1 if cursor is on a valid entry
+    int         in_range;   // 1 if cursor is within the scan bounds
+    WT_ITEM     end_key;    // A copy of the end key for bounds checking
+} wt_range_ctx_bin_t;
+
+static void wt_range_scan_close_bin(wt_range_ctx_bin_t* ctx);
+
+// Helper to compare two WT_ITEMs lexicographically.
+static int compare_wt_items(WT_ITEM *a, WT_ITEM *b) {
+    if (!a || !b) {
+        return 0;
+    }
+
+    size_t min_len = a->size < b->size ? a->size : b->size;
+    int cmp = memcmp(a->data, b->data, min_len);
+    if (cmp != 0) {
+        return cmp;
+    }
+    if (a->size < b->size) {
+        return -1;
+    }
+    if (a->size > b->size) {
+        return 1;
+    }
+    return 0;
+}
+
+// Initializes a binary range scan.
+static wt_range_ctx_bin_t* wt_range_scan_init_bin(WT_CONNECTION *conn, const char* uri,
+                                                  WT_ITEM *start_key, WT_ITEM *end_key) {
+    if (!conn || !uri || !start_key || !end_key) {
+        return NULL;
+    }
+
+    wt_range_ctx_bin_t *ctx = calloc(1, sizeof(wt_range_ctx_bin_t));
+    if (!ctx) {
+        return NULL;
+    }
+
+    // Copy end_key for bounds checking
+    if (end_key->size > 0) {
+        ctx->end_key.data = malloc(end_key->size);
+        if (!ctx->end_key.data) {
+            free(ctx);
+            return NULL;
+        }
+        memcpy(ctx->end_key.data, end_key->data, end_key->size);
+        ctx->end_key.size = end_key->size;
+    }
+
+    int err = conn->open_session(conn, NULL, NULL, &ctx->session);
+    if (err != 0 || !ctx->session) {
+        if (ctx->end_key.data) free(ctx->end_key.data);
+        free(ctx);
+        return NULL;
+    }
+
+    err = ctx->session->open_cursor(ctx->session, uri, NULL, NULL, &ctx->cursor);
+    if (err != 0 || !ctx->cursor) {
+        ctx->session->close(ctx->session, NULL);
+        if (ctx->end_key.data) free(ctx->end_key.data);
+        free(ctx);
+        return NULL;
+    }
+
+    // Position the cursor at the start of the range.
+    if (start_key->size == 0) {
+        // This is a full table scan from the beginning.
+        err = ctx->cursor->next(ctx->cursor);
+        if (err == WT_NOTFOUND) {
+            ctx->valid = 0;
+            ctx->in_range = 0;
+            return ctx; // Table is empty, not an error.
+        } else if (err != 0) {
+            wt_range_scan_close_bin(ctx);
+            return NULL; // Fatal error
+        }
+    } else {
+        // This is a range scan from a specific start key.
+        ctx->cursor->set_key(ctx->cursor, start_key);
+        int exact;
+        err = ctx->cursor->search_near(ctx->cursor, &exact);
+
+        if (err != 0) {
+            if (err == WT_NOTFOUND) {
+                ctx->valid = 0; // No keys >= start_key
+                ctx->in_range = 0;
+                return ctx;
+            }
+            wt_range_scan_close_bin(ctx);
+            return NULL;
+        }
+
+        if (exact < 0) {
+            // search_near landed before start_key, advance to the next record.
+            err = ctx->cursor->next(ctx->cursor);
+            if (err != 0) {
+                if (err == WT_NOTFOUND) {
+                    ctx->valid = 0; // No keys >= start_key
+                    ctx->in_range = 0;
+                    return ctx;
+                }
+                wt_range_scan_close_bin(ctx);
+                return NULL;
+            }
+        }
+    }
+
+    // Verify current position is within [start, end)
+    WT_ITEM curr_key;
+    if (ctx->cursor->get_key(ctx->cursor, &curr_key) != 0) {
+        ctx->valid = 0;
+        ctx->in_range = 0;
+        return ctx;
+    }
+    if (end_key->size > 0 && compare_wt_items(&curr_key, &ctx->end_key) >= 0) {
+        ctx->valid = 0;
+        ctx->in_range = 0;
+    } else {
+        ctx->valid = 1;
+        ctx->in_range = 1;
+    }
+
+    return ctx;
+}
+
+// Simple one-by-one binary range scan - get current key/value
+static int wt_range_scan_current_bin(wt_range_ctx_bin_t* ctx, WT_ITEM *out_key, WT_ITEM *out_val) {
+    if (!ctx || !out_key || !out_val) {
+        return -1;
+    }
+
+    if (!ctx->valid || !ctx->in_range) {
+        return 1; // End of scan
+    }
+
+    // Initialize output items
+    out_key->data = NULL;
+    out_key->size = 0;
+    out_val->data = NULL;
+    out_val->size = 0;
+
+    WT_ITEM key, val;
+    int err = ctx->cursor->get_key(ctx->cursor, &key);
+    if (err != 0) {
+        ctx->valid = 0;
+        return err;
+    }
+    err = ctx->cursor->get_value(ctx->cursor, &val);
+    if (err != 0) {
+        ctx->valid = 0;
+        return err;
+    }
+
+    // Copy key
+    out_key->data = malloc(key.size);
+    if (!out_key->data) {
+        return -1;
+    }
+    memcpy(out_key->data, key.data, key.size);
+    out_key->size = key.size;
+
+    // Copy value
+    out_val->data = malloc(val.size);
+    if (!out_val->data) {
+        free(out_key->data);
+        return -1;
+    }
+    memcpy(out_val->data, val.data, val.size);
+    out_val->size = val.size;
+
+    return 0;
+}
+
+// Advance to next record in binary range scan
+static int wt_range_scan_next_bin(wt_range_ctx_bin_t* ctx) {
+    if (!ctx) {
+        return -1;
+    }
+
+    if (!ctx->valid) {
+        return 1; // Already at end
+    }
+
+    int err = ctx->cursor->next(ctx->cursor);
+    if (err != 0) {
+        ctx->valid = 0;
+        return err == WT_NOTFOUND ? 1 : err; // WT_NOTFOUND means end of scan
+    }
+
+    // Check if next key is within bounds
+    WT_ITEM next_key;
+    err = ctx->cursor->get_key(ctx->cursor, &next_key);
+    if (err != 0) {
+        ctx->valid = 0;
+        return err;
+    }
+
+    if (ctx->end_key.size > 0 && compare_wt_items(&next_key, &ctx->end_key) >= 0) {
+        ctx->valid = 0;
+        ctx->in_range = 0;
+        return 1; // Out of range
+    }
+
+    return 0;
+}
+
+// Frees the scan context and associated resources.
+static void wt_range_scan_close_bin(wt_range_ctx_bin_t* ctx) {
+    if (!ctx) return;
+    if (ctx->cursor) ctx->cursor->close(ctx->cursor);
+    if (ctx->session) ctx->session->close(ctx->session, NULL);
+    if (ctx->end_key.data) free(ctx->end_key.data);
+    free(ctx);
+}
+
+// Free function for binary range scan items
+static void wt_free_binary_item(WT_ITEM *item) {
+    if (item && item->data) {
+        free(item->data);
+        item->data = NULL;
+        item->size = 0;
+    }
+}
+
+// Fetches a batch of key-value pairs for binary scans.
+// Buffer layout: [count u32][key_len u32][key bytes][val_len u32][val bytes] ...
+static int wt_range_scan_next_batch_bin(wt_range_ctx_bin_t* ctx, size_t max_buf_size,
+    unsigned char **out_buf, int *out_buf_len, int *out_count) {
+    if (!ctx || !out_buf || !out_buf_len || !out_count) return -1;
+    *out_buf = NULL; *out_buf_len = 0; *out_count = 0;
+    if (!ctx->valid || !ctx->in_range) return 0;
+
+    size_t capacity = max_buf_size > 0 ? max_buf_size : (size_t)1024 * 1024;
+    unsigned char *buf = (unsigned char*)malloc(capacity);
+    if (!buf) return -1;
+
+    unsigned char *ptr = buf;
+    size_t length = 0;
+    int count = 0;
+
+    // reserve space for count
+    if (capacity < sizeof(uint32_t)) { free(buf); return -1; }
+    ptr += sizeof(uint32_t);
+    length += sizeof(uint32_t);
+
+    while (ctx->valid && ctx->in_range) {
+        WT_ITEM key, val;
+        if (ctx->cursor->get_key(ctx->cursor, &key) != 0) { ctx->valid = 0; break; }
+        if (ctx->cursor->get_value(ctx->cursor, &val) != 0) { ctx->valid = 0; break; }
+
+        if (ctx->end_key.size > 0 && compare_wt_items(&key, &ctx->end_key) >= 0) {
+            ctx->in_range = 0; ctx->valid = 0; break;
+        }
+
+        size_t need = sizeof(uint32_t) + key.size + sizeof(uint32_t) + val.size;
+        if (length + need > capacity) break; // stop when full
+
+        uint32_t klen = (uint32_t)key.size;
+        memcpy(ptr, &klen, sizeof(klen)); ptr += sizeof(klen);
+        memcpy(ptr, key.data, key.size); ptr += key.size;
+        uint32_t vlen = (uint32_t)val.size;
+        memcpy(ptr, &vlen, sizeof(vlen)); ptr += sizeof(vlen);
+        memcpy(ptr, val.data, val.size); ptr += val.size;
+        length = (size_t)(ptr - buf);
+        count++;
+
+        int nerr = ctx->cursor->next(ctx->cursor);
+        if (nerr != 0) { ctx->valid = 0; break; }
+        // optional: we can peek the next key to short-circuit on end bound in next loop
+        if ((size_t)count >= 1000) break; // safety cap per batch
+    }
+
+    if (count > 0) {
+        uint32_t cnt = (uint32_t)count;
+        memcpy(buf, &cnt, sizeof(cnt));
+        *out_buf = buf;
+        *out_buf_len = (int)length;
+        *out_count = count;
+        return 0;
+    }
+    free(buf);
+    return 0;
+}
+
+static void wt_free_batch_buf_bin(unsigned char *buf) { if (buf) free(buf); }
 
 */
 import "C"
@@ -1192,9 +1484,8 @@ func (c *stringRangeCursor) Next() bool {
 	return true
 }
 
-// fetchNextBatch retrieves the next chunk of key-value pairs from C.
 func (c *stringRangeCursor) fetchNextBatch() error {
-	const batchSize = 1000 // Number of records to fetch per batch.
+	const batchSize = 1000
 	var cBuf *C.char
 	var cBufLen C.int
 	var numFetched C.int
@@ -1301,3 +1592,154 @@ func (s *cgoService) ScanRange(table, startKey, endKey string) (StringRangeCurso
 	}
 	return out, nil
 }
+
+// ============================================================================
+// BINARY RANGE SCAN IMPLEMENTATION
+// ============================================================================
+
+func (s *cgoService) ScanRangeBinary(table string, startKey, endKey []byte) (BinaryRangeCursor, error) {
+	if s.conn == nil {
+		return nil, errors.New("connection not open")
+	}
+
+	ctable := C.CString(table)
+	defer C.free(unsafe.Pointer(ctable))
+
+	var cStartKey, cEndKey C.WT_ITEM
+	if len(startKey) > 0 {
+		pStartKey := C.CBytes(startKey)
+		defer C.free(pStartKey)
+		cStartKey.data = pStartKey
+		cStartKey.size = C.size_t(len(startKey))
+	}
+	if len(endKey) > 0 {
+		pEndKey := C.CBytes(endKey)
+		defer C.free(pEndKey)
+		cEndKey.data = pEndKey
+		cEndKey.size = C.size_t(len(endKey))
+	}
+
+	ctx := C.wt_range_scan_init_bin(s.conn, ctable, &cStartKey, &cEndKey)
+	if ctx == nil {
+		return nil, errors.New("failed to initialize binary range scan")
+	}
+
+	return &binaryRangeCursor{
+		ctx:   ctx,
+		valid: ctx.valid == 1,
+	}, nil
+}
+
+type binaryRangeCursor struct {
+	ctx   *C.wt_range_ctx_bin_t
+	err   error
+	valid bool
+
+	buf  []byte // batch buffer
+	off  int    // offset in buf
+	left int    // remaining records in current batch
+
+	currKey []byte
+	currVal []byte
+}
+
+func (c *binaryRangeCursor) Next() bool {
+	if c.err != nil || c.ctx == nil {
+		c.valid = false
+		return false
+	}
+	if c.left == 0 {
+		if err := c.fetchBatch(); err != nil {
+			c.err = err
+			c.valid = false
+			return false
+		}
+		if c.left == 0 { // no more data
+			c.valid = false
+			return false
+		}
+	}
+	// parse one record
+	if c.off+4 > len(c.buf) {
+		c.err = errors.New("incomplete batch: key len")
+		c.valid = false
+		return false
+	}
+	klen := int(binary.LittleEndian.Uint32(c.buf[c.off:]))
+	c.off += 4
+	if c.off+klen+4 > len(c.buf) {
+		c.err = errors.New("incomplete batch: key")
+		c.valid = false
+		return false
+	}
+	key := c.buf[c.off : c.off+klen]
+	c.off += klen
+	vlen := int(binary.LittleEndian.Uint32(c.buf[c.off:]))
+	c.off += 4
+	if c.off+vlen > len(c.buf) {
+		c.err = errors.New("incomplete batch: value")
+		c.valid = false
+		return false
+	}
+	val := c.buf[c.off : c.off+vlen]
+	c.off += vlen
+
+	// store slices
+	// make copies to keep stable across Next calls
+	kcopy := make([]byte, len(key))
+	copy(kcopy, key)
+	vcopy := make([]byte, len(val))
+	copy(vcopy, val)
+	c.currKey = kcopy
+	c.currVal = vcopy
+
+	c.left--
+	c.valid = true
+	return true
+}
+
+func (c *binaryRangeCursor) fetchBatch() error {
+	// TODO: Make buffer sizes configurable from the outside.
+	const maxBuf = (1024 * 1024) * 2
+	var cBuf *C.uchar
+	var cBufLen C.int
+	var num C.int
+	code := C.wt_range_scan_next_batch_bin(c.ctx, C.size_t(maxBuf), &cBuf, &cBufLen, &num)
+	if code != 0 {
+		return fmt.Errorf("range batch failed: %d", int(code))
+	}
+	if num == 0 || cBuf == nil || cBufLen <= 0 {
+		c.buf = nil
+		c.off = 0
+		c.left = 0
+		return nil
+	}
+	// copy and free
+	c.buf = C.GoBytes(unsafe.Pointer(cBuf), cBufLen)
+	C.wt_free_batch_buf_bin(cBuf)
+	if len(c.buf) < 4 {
+		return errors.New("incomplete batch header")
+	}
+	c.left = int(binary.LittleEndian.Uint32(c.buf[0:4]))
+	c.off = 4
+	return nil
+}
+
+func (c *binaryRangeCursor) Current() ([]byte, []byte, error) {
+	if !c.valid {
+		return nil, nil, errors.New("cursor not on record")
+	}
+	return c.currKey, c.currVal, nil
+}
+
+func (c *binaryRangeCursor) Err() error { return c.err }
+
+func (c *binaryRangeCursor) Close() error {
+	if c.ctx != nil {
+		C.wt_range_scan_close_bin(c.ctx)
+		c.ctx = nil
+	}
+	return nil
+}
+
+func (c *binaryRangeCursor) Valid() bool { return c.valid }
