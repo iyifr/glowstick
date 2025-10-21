@@ -232,7 +232,7 @@ func RunParallelBSONExample() {
 				count++
 
 				// Unmarshal the data back into a User struct
-				var user User
+				var user BUser
 				if err := bson.Unmarshal(value, &user); err != nil {
 					log.Printf("Goroutine %d: Failed to unmarshal user: %v", goroutineID, err)
 					continue
