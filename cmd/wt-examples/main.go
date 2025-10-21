@@ -5,4 +5,5 @@ func main() {
 	// RunPerformanceTest()
 	//RunBSONExample()
 	RunParallelBSONExample()
+	//CacheOptimizationDemo()
 }

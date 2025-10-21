@@ -1625,22 +1625,25 @@ func (s *cgoService) ScanRangeBinary(table string, startKey, endKey []byte) (Bin
 	}
 
 	return &binaryRangeCursor{
-		ctx:   ctx,
-		valid: ctx.valid == 1,
+		ctx:          ctx,
+		valid:        ctx.valid == 1,
+		maxBatchSize: 24 * 1024, // 24KB - fits comfortably in L1 cache (32KB)
 	}, nil
 }
 
 type binaryRangeCursor struct {
-	ctx   *C.wt_range_ctx_bin_t
-	err   error
-	valid bool
+	ctx *C.wt_range_ctx_bin_t
+	err error
 
-	buf  []byte // batch buffer
+	buf  []byte // batch buffer - optimized for L1 cache
 	off  int    // offset in buf
 	left int    // remaining records in current batch
 
 	currKey []byte
 	currVal []byte
+
+	maxBatchSize int // Maximum batch size (default 24kb)
+	valid        bool
 }
 
 func (c *binaryRangeCursor) Next() bool {
@@ -1672,7 +1675,7 @@ func (c *binaryRangeCursor) Next() bool {
 		c.valid = false
 		return false
 	}
-	key := c.buf[c.off : c.off+klen]
+	c.currKey = c.buf[c.off : c.off+klen]
 	c.off += klen
 	vlen := int(binary.LittleEndian.Uint32(c.buf[c.off:]))
 	c.off += 4
@@ -1681,17 +1684,8 @@ func (c *binaryRangeCursor) Next() bool {
 		c.valid = false
 		return false
 	}
-	val := c.buf[c.off : c.off+vlen]
+	c.currVal = c.buf[c.off : c.off+vlen]
 	c.off += vlen
-
-	// store slices
-	// make copies to keep stable across Next calls
-	kcopy := make([]byte, len(key))
-	copy(kcopy, key)
-	vcopy := make([]byte, len(val))
-	copy(vcopy, val)
-	c.currKey = kcopy
-	c.currVal = vcopy
 
 	c.left--
 	c.valid = true
@@ -1699,8 +1693,8 @@ func (c *binaryRangeCursor) Next() bool {
 }
 
 func (c *binaryRangeCursor) fetchBatch() error {
-	// TODO: Make buffer sizes configurable from the outside.
-	const maxBuf = (1024 * 1024) * 2
+	// Use L1 cache-optimized buffer size (24KB fits comfortably in 32KB L1)
+	maxBuf := c.maxBatchSize
 	var cBuf *C.uchar
 	var cBufLen C.int
 	var num C.int
@@ -1743,3 +1737,14 @@ func (c *binaryRangeCursor) Close() error {
 }
 
 func (c *binaryRangeCursor) Valid() bool { return c.valid }
+
+func (c *binaryRangeCursor) SetBatchSize(size int) {
+	if size > 0 {
+		c.maxBatchSize = size
+	}
+}
+
+// GetBatchSize returns the current batch size
+func (c *binaryRangeCursor) GetBatchSize() int {
+	return c.maxBatchSize
+}

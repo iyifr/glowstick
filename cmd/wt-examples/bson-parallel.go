@@ -97,7 +97,7 @@ func RunParallelBSONExample() {
 		log.Fatalf("Failed to create table: %v", err)
 	}
 	fmt.Println("\n--- Generating and Storing 1,000,000 BSON user data ---")
-	numUsers := 100000
+	numUsers := 10000
 	users := make([]BUser, numUsers)
 
 	// Time the data generation
@@ -154,21 +154,13 @@ func RunParallelBSONExample() {
 
 	// 2. Split into batches for parallel scanning with performance measurement
 	fmt.Println("\n--- Parallel Scanning with 8 Goroutines (Performance Test) ---")
-	numGoroutines := 8
+	numGoroutines := 10
 
 	var wg sync.WaitGroup
 	var totalRecordsRead int64
 	var totalBytesRead int64
 
 	scanStart := time.Now()
-
-	// NOTE: Correction: To avoid losing records at the end boundary, make batches overlap by 1 at the boundary except last.
-	// Much simpler: We make each batch [start, end], but use startKey == users[startIdx].ID[:] and endKey == users[endIdx].ID[:] (exclusive),
-	// and for the last batch, endKey = 0xFF...FF (max).
-	// But since ScanRangeBinary is likely [start, end) and we want inclusive coverage, the safest way is:
-	//   - for batches except last: set endKey = users[endIdx].ID[:] and set scan to [startKey, endKey), so all ObjectIDs appear in exactly one batch (no gaps).
-	//   - for the last batch, endKey = 0xFF...FF (to include all remaining).
-	//   - batchRanges[i][1] is always the start of the NEXT batch, so we use that user's ObjectId as the endKey.
 
 	batchRanges := computeBatchRanges(numUsers, numGoroutines)
 	for i, rng := range batchRanges {
@@ -215,6 +207,8 @@ func RunParallelBSONExample() {
 				return
 			}
 			defer cursor.Close()
+
+			cursor.SetBatchSize(192 * (1024 * 1024))
 
 			fmt.Printf("Goroutine %d: Starting scan from %s (idx=%d) to %s (idx=%d)\n",
 				goroutineID, primitive.ObjectID(startKey).Hex(), batchStart, primitive.ObjectID(endKey).Hex(), batchEnd-1)

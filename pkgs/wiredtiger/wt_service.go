@@ -56,4 +56,8 @@ type BinaryRangeCursor interface {
 	Err() error
 	Close() error
 	Valid() bool
+
+	// Cache optimization methods
+	SetBatchSize(size int) // Configure batch size for optimal cache performance
+	GetBatchSize() int     // Get current batch size
 }
