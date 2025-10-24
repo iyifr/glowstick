@@ -165,6 +165,15 @@ static int wt_get_bin(WT_CONNECTION *conn, const char* uri,
                       const unsigned char* key, size_t key_len,
                       WT_ITEM *outVal) {
 	if (!conn || !uri || !key || !outVal) return -1;
+
+	// Initialize output to safe values
+	outVal->data = NULL;
+	outVal->size = 0;
+
+	if (key_len == 0 || key_len > 1024) {
+		return -1; // Invalid key length
+	}
+
     WT_SESSION *session = NULL;
     WT_CURSOR *cursor = NULL;
     int err = conn->open_session(conn, NULL, NULL, &session);
@@ -172,8 +181,14 @@ static int wt_get_bin(WT_CONNECTION *conn, const char* uri,
     if (!session) return -1;
 
     err = session->open_cursor(session, uri, NULL, NULL, &cursor);
-    if (err != 0) { session->close(session, NULL); return err; }
-    if (!cursor) { session->close(session, NULL); return -1; }
+    if (err != 0) {
+    	session->close(session, NULL);
+    	return err;
+    }
+    if (!cursor) {
+    	session->close(session, NULL);
+    	return -1;
+    }
 
     WT_ITEM key_item;
     key_item.data = (void*)key;
@@ -181,19 +196,27 @@ static int wt_get_bin(WT_CONNECTION *conn, const char* uri,
     cursor->set_key(cursor, &key_item);
 
     err = cursor->search(cursor);
-    if (err != 0) { cursor->close(cursor); session->close(session, NULL); return err; }
+    if (err != 0) {
+    	cursor->close(cursor);
+    	session->close(session, NULL);
+    	return err;
+    }
 
-    WT_ITEM *val;
+    WT_ITEM val;
     err = cursor->get_value(cursor, &val);
-    if (err == 0) {
-        outVal->data = malloc(val->size);
+    if (err == 0 && val.data && val.size > 0) {
+        outVal->data = malloc(val.size);
         if (!outVal->data) {
             cursor->close(cursor);
             session->close(session, NULL);
             return -1;
         }
-       memcpy(outVal->data, (void*)val->data, val->size);
-	   outVal->size = val->size;
+        memcpy(outVal->data, val.data, val.size);
+        outVal->size = val.size;
+    } else {
+    	// No data found or invalid data
+    	outVal->data = NULL;
+    	outVal->size = 0;
     }
 
     int cerr = cursor->close(cursor);
