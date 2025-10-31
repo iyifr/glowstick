@@ -1658,7 +1658,7 @@ type binaryRangeCursor struct {
 	ctx *C.wt_range_ctx_bin_t
 	err error
 
-	buf  []byte // batch buffer - optimized for L1 cache
+	buf  []byte // batch buffer
 	off  int    // offset in buf
 	left int    // remaining records in current batch
 
@@ -1716,7 +1716,6 @@ func (c *binaryRangeCursor) Next() bool {
 }
 
 func (c *binaryRangeCursor) fetchBatch() error {
-	// Use L1 cache-optimized buffer size (24KB fits comfortably in 32KB L1)
 	maxBuf := c.maxBatchSize
 	var cBuf *C.uchar
 	var cBufLen C.int

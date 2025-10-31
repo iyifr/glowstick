@@ -1,8 +1,6 @@
-# WiredTiger Go Service Layer
+# WiredTiger Go Layer
 
-Provides a minimal, high-performance Go interface to the WiredTiger storage engine via CGO. Exposes both string and binary key-value tables, optimized for embeddable document/database workloads requiring scalable, transactional tables.
-
-This abstraction is intentionally generic and low-level: it enables fast, type-agnostic persistence for services or libraries that need modern key-value or document storage. It does not implement query languages, indexing, or domain-specific logic—these belong at higher application layers.
+Provides a minimal Go interface to the WiredTiger storage engine via CGO. Exposes both string and binary key-value tables.
 
 ## Service Methods
 
@@ -12,7 +10,7 @@ All APIs are on the `WTService` interface.
 
 - `Open(home string, config string) error` — Open/create a database at a directory.
 - `Close() error` — Close the current database connection.
-- `CreateTable(name string, config string) error` — Create a table (string or binary keys/values, configurable).
+- `CreateTable(name string, config string) error` — Create a table (string or binary keys/values, configurable with config string).
 
 **String Key/Value Operations:**
 
@@ -32,7 +30,8 @@ All APIs are on the `WTService` interface.
 - `ScanBinary(table string) ([]BinaryKeyValuePair, error)`
 - `SearchNearBinary(table string, probeKey []byte) ([]byte, []byte, int, bool, error)`
 
-**Convenience (String<->Binary Mapping):**
+**(String<->Binary Mapping):**
+Store a string key with a binary value.
 
 - `PutBinaryWithStringKey(table, stringKey string, value []byte) error`
 - `GetBinaryWithStringKey(table, stringKey string) ([]byte, bool, error)`
@@ -44,5 +43,3 @@ All APIs are on the `WTService` interface.
 - `ScanRangeBinary(table string, startKey, endKey []byte) (BinaryRangeCursor, error)`
 
 ---
-
-See official [WiredTiger documentation](http://source.wiredtiger.com/) for details on configuration options, table types, and low-level tuning.
