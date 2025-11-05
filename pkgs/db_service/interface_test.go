@@ -80,3 +80,70 @@ func TestCreateDb(t *testing.T) {
 	}
 
 }
+
+func TestCreateCollection(t *testing.T) {
+	wtService := wiredtiger.WiredTiger()
+
+	if _, err := os.Stat(WIREDTIGER_DIR); os.IsNotExist(err) {
+		if mkErr := os.MkdirAll(WIREDTIGER_DIR, 0755); mkErr != nil {
+			t.Fatalf("failed to create WT_HOME_TEST dir: %v", mkErr)
+		}
+	}
+
+	if err := wtService.Open(WIREDTIGER_DIR, "create"); err != nil {
+		t.Log("Err occured")
+	}
+
+	defer func() {
+		if err := wtService.Close(); err != nil {
+			fmt.Printf("Warning: failed to close connection: %v\n", err)
+		}
+		os.RemoveAll("volumes/WT_HOME_TEST")
+	}()
+
+	dbName := "default"
+	collName := "tenant_id_1"
+
+	params := DbParams{
+		Name:      dbName,
+		KvService: wtService,
+	}
+
+	dbSvc := DatabaseService(params)
+
+	// Create the db
+	err := dbSvc.CreateDB()
+
+	if err != nil {
+		t.Errorf("Failed to create Db; %s", err)
+	}
+
+	dbSvc.CreateCollection(collName)
+
+	fmt.Printf("URI: %s\n", fmt.Sprintf("%s.%s", dbName, collName))
+
+	val, key_exists, err := wtService.GetBinaryWithStringKey(CATALOG_TABLE_URI, fmt.Sprintf("%s.%s", dbName, collName))
+
+	if !key_exists {
+		t.Errorf("DB value not persisted.")
+	}
+
+	if err != nil {
+		t.Errorf("Error occurred in test: %v", err)
+	}
+
+	// Check if value is valid BSON and unmarshal back into struct
+	if len(val) == 0 {
+		t.Errorf("Returned value was empty ([]byte length == 0)")
+	}
+
+	var entry CollectionCatalogEntry
+	unmarshalErr := bson.Unmarshal(val[:], &entry)
+	if unmarshalErr != nil {
+		t.Errorf("Failed to unmarshal BSON value: %v", unmarshalErr)
+	}
+	if entry.Ns != fmt.Sprintf("%s.%s", dbName, collName) {
+		t.Errorf("Unmarshaled CollectionCatalogEntry Ns does not match: got %s, want %s", entry.Ns, fmt.Sprintf("%s.%s", dbName, collName))
+	}
+
+}

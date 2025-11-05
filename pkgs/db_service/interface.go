@@ -3,6 +3,7 @@ package dbservice
 import (
 	"fmt"
 	"os"
+	"time"
 
 	wt "glowstickdb/pkgs/wiredtiger"
 
@@ -18,10 +19,30 @@ type DbCatalogEntry struct {
 	Config map[string]string `bson:"config"`
 }
 
+type CollectionIndex struct {
+	Id   string                 `bson:"_id"`
+	Key  map[string]int         `bson:"key"` // field name -> sort order/type (e.g., 1 for asc, -1 for desc)
+	Name string                 `bson:"name"`
+	Ns   string                 `bson:"ns"`             // namespace: "db.collection"
+	Type string                 `bson:"type"`           // index type, e.g., "single", "2dsphere", etc.
+	V    int                    `bson:"v"`              // version number
+	Opts map[string]interface{} `bson:"opts,omitempty"` // additional index options, optional
+}
+
+type CollectionCatalogEntry struct {
+	Id               primitive.ObjectID `bson:"_id"`
+	Ns               string             `bson:"ns"`
+	TableUri         string             `bson:"table_uri"`
+	IndexTableUriMap map[string]string  `bson:"index_table_uri_map,omitempty"`
+	Indexes          []CollectionIndex  `bson:"indexes,omitempty"`
+	CreatedAt        primitive.DateTime `bson:"createdAt"`
+	UpdatedAt        primitive.DateTime `bson:"updatedAt"`
+}
+
 type DBService interface {
 	CreateDB() error
 	DeleteDB(name string) error
-	CreateCollection(db string) error
+	CreateCollection(collection_name string) error
 	ListCollections() error
 }
 
@@ -78,6 +99,41 @@ func (s *GDBService) DeleteDB(name string) error {
 }
 
 func (s *GDBService) CreateCollection(collection_name string) error {
+	kv := s.KvService
+
+	// Pass in the kv service to init tables (to avoid one-off failures)
+	err := InitTablesHelper(kv)
+	if err != nil {
+		return err
+	}
+
+	if len(collection_name) == 0 {
+		return fmt.Errorf("collection name cannot be empty")
+	}
+
+	collectionId := primitive.NewObjectID()
+	collectionTableUri := fmt.Sprintf("table:collection-%s-%s", collectionId.Hex(), s.Name)
+
+	catalogEntry := CollectionCatalogEntry{
+		Id:        collectionId,
+		Ns:        fmt.Sprintf("%s.%s", s.Name, collection_name),
+		TableUri:  collectionTableUri,
+		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
+		UpdatedAt: primitive.NewDateTimeFromTime(time.Now()),
+	}
+
+	doc, err := bson.Marshal(catalogEntry)
+
+	if err != nil {
+		return fmt.Errorf("[GDBSERVICE:CreateCollection]: Failed to encode catalog entry")
+	}
+
+	err = kv.PutBinaryWithStringKey(CATALOG_TABLE_URI, fmt.Sprintf("%s.%s", s.Name, collection_name), doc)
+
+	if err != nil {
+		return fmt.Errorf("failed to write db catalog entry")
+	}
+
 	return nil
 }
 
@@ -85,18 +141,16 @@ func (s *GDBService) ListCollections() error {
 	return nil
 }
 
-// Initialize necessary tables
 func InitTablesHelper(wtService wt.WTService) error {
-
 	if _, err := os.Stat("volumes/WT_HOME"); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll("volumes/WT_HOME", 0755); mkErr != nil {
 			return fmt.Errorf("failed to create volumes/db_files: %w", mkErr)
 		}
 	}
 
-	// Create table
 	if err := wtService.CreateTable(CATALOG_TABLE_URI, "key_format=u,value_format=u"); err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
+
 	return nil
 }
