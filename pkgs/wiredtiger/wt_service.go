@@ -25,7 +25,6 @@ type WTService interface {
 	ScanRangeBinary(table string, startKey, endKey []byte) (BinaryRangeCursor, error)
 }
 
-// New returns a Service implementation backed by cgo (when enabled).
 func WiredTiger() WTService {
 	return WiredTigerService()
 }
@@ -42,7 +41,8 @@ type BinaryKeyValuePair struct {
 
 // StringRangeCursor provides cursor-based range iteration for string keys
 type StringRangeCursor interface {
-	Next() bool                             // Iterate forward
+	Next() bool
+	// TODO: Add Prev() for backwards iteration                            // Iterate forward
 	CurrentString() (string, string, error) // Get key, value
 	Err() error
 	Close() error
@@ -51,13 +51,12 @@ type StringRangeCursor interface {
 
 // BinaryRangeCursor provides cursor-based range iteration for binary keys
 type BinaryRangeCursor interface {
-	Next() bool                       // Iterate forward
+	Next() bool // Iterate forward
+	// TODO: Add Prev() method for backwards iteration
 	Current() ([]byte, []byte, error) // Get key, value
 	Err() error
 	Close() error
 	Valid() bool
-
-	// Cache optimization methods
-	SetBatchSize(size int) // Configure batch size for optimal cache performance
+	SetBatchSize(size int) // Configure batch size
 	GetBatchSize() int     // Get current batch size
 }
