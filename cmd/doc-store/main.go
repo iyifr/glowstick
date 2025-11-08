@@ -22,22 +22,27 @@ type Document struct {
 	Embedding []float64          `bson:"embedding"`
 }
 
-func generateNormalizedVector(d int, f faiss.FAISSService) ([]float32, []float64) {
+var LABEL_TO_ID_TABLE_URI = "table:docId_vectorId"
+
+func generateNormalizedVector(d int, faiss faiss.FAISSService) ([]float32, []float64) {
 	vec := make([]float32, d)
-	for i := 0; i < d; i++ {
+	for i := range vec {
 		vec[i] = rand.Float32()
 	}
 	// Normalize in-place with FAISS utilities
-	f.Normalize(vec)
+	faiss.Normalize(vec)
 	// Convert to float64 slice for BSON storage
 	vec64 := make([]float64, d)
-	for i := 0; i < d; i++ {
+	for i := range vec64 {
 		vec64[i] = float64(vec[i])
 	}
 	return vec, vec64
 }
 
 func main() {
+	// Uncomment to run catalog demos
+	// runCatalogDemos()
+	// return
 
 	wt := wiredtiger.WiredTiger()
 	fs := faiss.FAISS()
@@ -128,7 +133,8 @@ func main() {
 	}
 	fmt.Printf("Total records: %d\n", len(pairs))
 
-	k := 5
+	k := 10
+	min_distance := 0.475
 	randVec := make([]float32, dim)
 	for i := 0; i < dim; i++ {
 		randVec[i] = rand.Float32()
@@ -139,13 +145,13 @@ func main() {
 
 	searchForRelevantDocs(
 		SearchForRelevantDocsPayload{
-			VectorIndex:          *index,
-			QueryEmbedding:       randVec,
-			TopK:                 &k,
-			LabelToDocIdTableUri: "table:docId_vectorId",
-			DocTableURI:          uri,
-			KvService:            wt,
-			Results:              &relevantDocs,
+			VectorIndex:    *index,
+			QueryEmbedding: randVec,
+			TopK:           &k,
+			DocTableURI:    uri,
+			KvService:      &wt,
+			Results:        &relevantDocs,
+			MinDistance:    &min_distance,
 		},
 	)
 	if err != nil {
@@ -169,7 +175,6 @@ type DocEmbeddingsPayload struct {
 }
 
 func insertDocEmbeddings(payload DocEmbeddingsPayload) error {
-	// Insert embedding into table
 	embedding := payload.Embedding
 	Idx := payload.vectorIndex
 
@@ -211,26 +216,38 @@ func float64SliceToFloat32(xs []float64) []float32 {
 }
 
 type SearchForRelevantDocsPayload struct {
-	VectorIndex          faiss.Index // faiss index to search for
-	QueryEmbedding       []float32
-	TopK                 *int
-	LabelToDocIdTableUri string // Table to lookup once we get labels from faiss index search call
-	DocTableURI          string
-	Results              *[]Document // outpointer to results, a slice of User
-	Threshold            *float32    // optional out pointer to threshold
-	KvService            wiredtiger.WTService
+	VectorIndex    faiss.Index // vector index in memory.
+	QueryEmbedding []float32
+	TopK           *int
+	DocTableURI    string
+	Results        *[]Document // outpointer to results, a slice of User
+	MinDistance    *float64    // optional out pointer to distance threshold
+	KvService      *wiredtiger.WTService
 }
 
 func searchForRelevantDocs(payload SearchForRelevantDocsPayload) {
 	xq := payload.QueryEmbedding
 
 	nq := 1 // number of queries
-	var k int
+	var k = 5
+	var min_distance float64
+	var kv_service wiredtiger.WTService
+
 	if payload.TopK != nil {
 		k = *payload.TopK
-	} else {
-		k = 5
 	}
+
+	if payload.MinDistance != nil {
+		min_distance = *payload.MinDistance
+	}
+
+	if payload.KvService == nil {
+		fmt.Print("No KV service impl passed")
+		return
+	}
+
+	kv_service = *payload.KvService
+
 	distances, ids, err := payload.VectorIndex.Search(xq, nq, k)
 
 	if err != nil {
@@ -238,60 +255,65 @@ func searchForRelevantDocs(payload SearchForRelevantDocsPayload) {
 	}
 
 	// For each id, lookup the docID in the table, assuming KvService has a GetString(uri, key string) (val string, err error).
-	if payload.LabelToDocIdTableUri != "" && ids != nil {
-		for index, id := range ids {
-			// id could be -1 if FAISS returned a "no result"; handle this
-			if id < 0 {
+	for index, id := range ids {
+		// id could be -1 if FAISS returned a "no result"; handle this
+		if id < 0 {
+			continue
+		}
+		key := fmt.Sprintf("%d", id)
+		val, _, err := kv_service.GetString(LABEL_TO_ID_TABLE_URI, key)
+		if err != nil {
+			fmt.Printf("Failed to get docID for label %s: %v\n", key, err)
+			continue
+		}
+
+		// Parse val as a BSON ObjectID hex string and use its raw 12-byte representation as the key
+		if payload.DocTableURI != "" {
+			// Validate hex string length (ObjectID should be 24 hex chars = 12 bytes)
+			if len(val) != 24 {
+				fmt.Printf("Invalid ObjectID hex length: expected 24, got %d for '%s'\n", len(val), val)
 				continue
 			}
-			key := fmt.Sprintf("%d", id)
-			val, _, err := payload.KvService.GetString(payload.LabelToDocIdTableUri, key)
+
+			objectID, err := primitive.ObjectIDFromHex(val)
 			if err != nil {
-				fmt.Printf("Failed to get docID for label %s: %v\n", key, err)
+				fmt.Printf("Failed to parse docID '%s' as ObjectID hex: %v\n", val, err)
 				continue
 			}
 
-			// Parse val as a BSON ObjectID hex string and use its raw 12-byte representation as the key
-			if payload.DocTableURI != "" {
-				// Validate hex string length (ObjectID should be 24 hex chars = 12 bytes)
-				if len(val) != 24 {
-					fmt.Printf("Invalid ObjectID hex length: expected 24, got %d for '%s'\n", len(val), val)
+			// Validate the ObjectID is not empty/zero
+			if objectID.IsZero() {
+				fmt.Printf("ObjectID is zero/empty for hex '%s'\n", val)
+				continue
+			}
+
+			docIDBytes := objectID[:] // Convert ObjectID to raw [12]byte slice
+
+			// Validate the binary key length
+			if len(docIDBytes) != 12 {
+				fmt.Printf("Invalid docIDBytes length: expected 12, got %d\n", len(docIDBytes))
+				continue
+			}
+
+			docBin, _, err := kv_service.GetBinary(payload.DocTableURI, docIDBytes)
+			if err != nil {
+				fmt.Printf("Failed to get document for docID %s in table %s: %v\n", val, payload.DocTableURI, err)
+				continue
+			}
+			if len(docBin) > 0 {
+				var doc Document
+
+				if err := bson.Unmarshal(docBin, &doc); err != nil {
+					fmt.Printf("Failed to unmarshal BSON for docID %s: %v\n", val, err)
 					continue
 				}
 
-				objectID, err := primitive.ObjectIDFromHex(val)
-				if err != nil {
-					fmt.Printf("Failed to parse docID '%s' as ObjectID hex: %v\n", val, err)
-					continue
-				}
+				fmt.Printf("DocID: %s, Distance: %f\n", val, distances[index])
 
-				// Validate the ObjectID is not empty/zero
-				if objectID.IsZero() {
-					fmt.Printf("ObjectID is zero/empty for hex '%s'\n", val)
-					continue
-				}
-
-				docIDBytes := objectID[:] // Convert ObjectID to raw [12]byte slice
-
-				// Validate the binary key length
-				if len(docIDBytes) != 12 {
-					fmt.Printf("Invalid docIDBytes length: expected 12, got %d\n", len(docIDBytes))
-					continue
-				}
-
-				docBin, _, err := payload.KvService.GetBinary(payload.DocTableURI, docIDBytes)
-				if err != nil {
-					fmt.Printf("Failed to get document for docID %s in table %s: %v\n", val, payload.DocTableURI, err)
-					continue
-				}
-				if len(docBin) > 0 {
-					var doc Document
-					if err := bson.Unmarshal(docBin, &doc); err != nil {
-						fmt.Printf("Failed to unmarshal BSON for docID %s: %v\n", val, err)
-					} else {
-						fmt.Printf("DocID: %s, Distance: %f\n", val, distances[index])
-						*payload.Results = append(*payload.Results, doc)
-					}
+				if float64(distances[index]) < min_distance {
+					*payload.Results = append(*payload.Results, doc)
+				} else {
+					fmt.Printf("DocID: %s, skipped\n", val)
 				}
 			}
 		}

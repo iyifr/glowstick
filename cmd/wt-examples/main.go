@@ -1,9 +1,9 @@
 package main
 
 func main() {
-	// RunRangeScanExample()
+	RunRangeScanExample()
 	// RunPerformanceTest()
 	//RunBSONExample()
-	RunParallelBSONExample()
+	//RunParallelBSONExample()
 	//CacheOptimizationDemo()
 }
