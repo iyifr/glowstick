@@ -310,6 +310,14 @@ func (s *GDBService) QueryCollection(collection_name string, query QueryStruct) 
 
 	distances, ids, err := idx.Search(query.QueryEmbedding, 1, int(query.TopK))
 
+	// Print distances and IDs in a table format
+	fmt.Printf("\n%-10s %-15s\n", "Index", "Distance")
+	fmt.Printf("%-10s %-15s\n", "-----", "--------")
+	for i, distance := range distances {
+		fmt.Printf("%-10d %-15.6f\n", ids[i], distance)
+	}
+	fmt.Println()
+
 	if err != nil {
 		return nil, fmt.Errorf("[DB_SERVICE:QueryCollection] - failed to search vector index for query embedding")
 	}
@@ -326,6 +334,8 @@ func (s *GDBService) QueryCollection(collection_name string, query QueryStruct) 
 	var lastErr error = err
 	for _, index := range indices {
 		id := ids[index]
+
+		fmt.Printf("ID: %d\n", id)
 		distance := distances[index]
 
 		// id could be -1 if FAISS returned a "no result"; handle this
@@ -368,12 +378,17 @@ func (s *GDBService) QueryCollection(collection_name string, query QueryStruct) 
 			continue
 		}
 
-		docBin, _, err := kv.GetBinary(collection.TableUri, docIDBytes)
+		docBin, exists, err := kv.GetBinary(collection.TableUri, docIDBytes)
 		if err != nil {
 			fmt.Printf("Failed to get document for docID %s in table %s: %v\n", val, collection.TableUri, err)
 			lastErr = err
 			continue
 		}
+
+		if !exists {
+			return nil, fmt.Errorf("failed to get document with id %v", val)
+		}
+
 		if len(docBin) > 0 {
 			var doc GlowstickDocument
 
@@ -385,7 +400,7 @@ func (s *GDBService) QueryCollection(collection_name string, query QueryStruct) 
 
 			fmt.Printf("DocID: %s, Distance: %f\n", val, distance)
 
-			if query.MinDistance == 0 || distance < query.MinDistance {
+			if query.MaxDistance == 0 || distance < query.MaxDistance {
 				docs = append(docs, doc)
 			} else {
 				fmt.Printf("DocID: %s, skipped\n", val)

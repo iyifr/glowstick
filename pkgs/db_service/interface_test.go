@@ -27,12 +27,12 @@ func TestCreateDb(t *testing.T) {
 		t.Log("Err occured")
 	}
 
-	defer func() {
+	t.Cleanup(func() {
 		if err := wtService.Close(); err != nil {
 			fmt.Printf("Warning: failed to close connection: %v\n", err)
 		}
-		//os.RemoveAll("volumes/WT_HOME_TEST")
-	}()
+		os.RemoveAll("volumes/WT_HOME_TEST")
+	})
 
 	name := "default"
 
@@ -97,13 +97,6 @@ func TestCreateCollection(t *testing.T) {
 		t.Log("Err occured")
 	}
 
-	defer func() {
-		if err := wtService.Close(); err != nil {
-			fmt.Printf("Warning: failed to close connection: %v\n", err)
-		}
-		// os.RemoveAll("volumes/WT_HOME_TEST")
-	}()
-
 	dbName := "default"
 	collName := "tenant_id_1"
 
@@ -122,6 +115,27 @@ func TestCreateCollection(t *testing.T) {
 	}
 
 	dbSvc.CreateCollection(collName)
+
+	// Get vector index URI for cleanup
+	collectionDefKey := fmt.Sprintf("%s.%s", dbName, collName)
+	val, exists, err := wtService.GetBinary(CATALOG, []byte(collectionDefKey))
+	var vectorIndexPath string
+	if err == nil && exists {
+		var catalogEntry CollectionCatalogEntry
+		if bson.Unmarshal(val, &catalogEntry) == nil {
+			vectorIndexPath = catalogEntry.VectorIndexUri
+		}
+	}
+
+	t.Cleanup(func() {
+		if err := wtService.Close(); err != nil {
+			fmt.Printf("Warning: failed to close connection: %v\n", err)
+		}
+		if vectorIndexPath != "" {
+			os.Remove(vectorIndexPath)
+		}
+		os.RemoveAll("volumes/WT_HOME_TEST")
+	})
 
 	fmt.Printf("URI: %s\n", fmt.Sprintf("%s.%s", dbName, collName))
 
@@ -163,13 +177,6 @@ func TestInsertDocuments(t *testing.T) {
 	if err := wtService.Open(WIREDTIGER_DIR, "create"); err != nil {
 		t.Log("Err occured")
 	}
-
-	defer func() {
-		if err := wtService.Close(); err != nil {
-			fmt.Printf("Warning: failed to close connection: %v\n", err)
-		}
-		// os.RemoveAll("volumes/WT_HOME_TEST")
-	}()
 
 	dbName := "default"
 	collName := "tenant_id_1"
@@ -277,6 +284,16 @@ func TestInsertDocuments(t *testing.T) {
 		}
 	}
 
+	t.Cleanup(func() {
+		if err := wtService.Close(); err != nil {
+			fmt.Printf("Warning: failed to close connection: %v\n", err)
+		}
+		if catalogEntry.VectorIndexUri != "" {
+			os.Remove(catalogEntry.VectorIndexUri)
+		}
+		os.RemoveAll("volumes/WT_HOME_TEST")
+	})
+
 }
 
 func TestBasicVectorQuery(t *testing.T) {
@@ -291,13 +308,6 @@ func TestBasicVectorQuery(t *testing.T) {
 	if err := wtService.Open(WIREDTIGER_DIR, "create"); err != nil {
 		t.Log("Err occured")
 	}
-
-	defer func() {
-		if err := wtService.Close(); err != nil {
-			fmt.Printf("Warning: failed to close connection: %v\n", err)
-		}
-		// os.RemoveAll("volumes/WT_HOME_TEST")
-	}()
 
 	dbName := "default"
 	collName := "tenant_id_1"
@@ -320,31 +330,72 @@ func TestBasicVectorQuery(t *testing.T) {
 		t.Errorf("Failed to create collection: %s", err)
 	}
 
-	documents := []GlowstickDocument{
-		{
+	documents := make([]GlowstickDocument, 10)
+	for i := 0; i < 10; i++ {
+		documents[i] = GlowstickDocument{
 			_Id:       primitive.NewObjectID(),
-			Content:   "First example document",
+			Content:   fmt.Sprintf("Example document number %d", i+1),
 			Embedding: genEmbeddings(1536),
-			Metadata:  map[string]interface{}{"type": "example", "index": 1},
-		},
-		{
-			_Id:       primitive.NewObjectID(),
-			Content:   "Second example document",
-			Embedding: genEmbeddings(1536),
-			Metadata:  map[string]interface{}{"type": "example", "index": 2},
-		},
-		{
-			_Id:       primitive.NewObjectID(),
-			Content:   "Third example document",
-			Embedding: genEmbeddings(1536),
-			Metadata:  map[string]interface{}{"type": "example", "index": 3},
-		},
+			Metadata:  map[string]interface{}{"type": "example", "index": i + 1},
+		}
 	}
 
 	err = dbSvc.InsertDocumentsIntoCollection(collName, documents)
 	if err != nil {
 		t.Errorf("InsertDocumentsIntoCollection returned error: %v", err)
 	}
+
+	// Get vector index URI for cleanup
+	collectionDefKey := fmt.Sprintf("%s.%s", dbName, collName)
+	val, exists, err := wtService.GetBinary(CATALOG, []byte(collectionDefKey))
+	var vectorIndexPath string
+	if err == nil && exists {
+		var catalogEntry CollectionCatalogEntry
+		if bson.Unmarshal(val, &catalogEntry) == nil {
+			vectorIndexPath = catalogEntry.VectorIndexUri
+		}
+	}
+
+	t.Cleanup(func() {
+		if err := wtService.Close(); err != nil {
+			fmt.Printf("Warning: failed to close connection: %v\n", err)
+		}
+		if vectorIndexPath != "" {
+			os.Remove(vectorIndexPath)
+		}
+		os.RemoveAll("volumes/WT_HOME_TEST")
+	})
+
+	topK := 5
+
+	query := QueryStruct{
+		TopK:           int32(topK),
+		QueryEmbedding: genEmbeddings(1536),
+	}
+
+	docs, err := dbSvc.QueryCollection(collName, query)
+
+	if err != nil {
+		t.Errorf("error occured during query %v", err)
+	}
+
+	if len(docs) == 0 {
+		t.Log("No docs returned")
+	}
+	t.Logf("Query returned %d documents:\n", len(docs))
+	for i, doc := range docs {
+		t.Logf("Document %d:\n", i+1)
+		t.Logf("  ID: %s\n", doc._Id.Hex())
+		t.Logf("  Content: %s\n", doc.Content)
+		t.Logf("  Metadata: %+v\n", doc.Metadata)
+		t.Logf("  Embedding length: %d\n", len(doc.Embedding))
+		t.Log()
+	}
+
+	if len(docs) != topK {
+		t.Error("Returned docs don't match top K")
+	}
+
 }
 
 func genEmbeddings(dim int) []float32 {

@@ -20,7 +20,7 @@ type GlowstickDocument struct {
 
 type QueryStruct struct {
 	TopK           int32
-	MinDistance    float32
+	MaxDistance    float32
 	QueryEmbedding []float32
 	Filters        map[string]interface{}
 }
