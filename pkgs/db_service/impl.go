@@ -6,6 +6,7 @@ import (
 	wt "glowstickdb/pkgs/wiredtiger"
 	"net/url"
 	"os"
+	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -73,7 +74,7 @@ func (s *GDBService) CreateDB() error {
 		return err
 	}
 
-	err = s.KvService.PutBinaryWithStringKey(CATALOG_TABLE_URI, fmt.Sprintf("db:%s", s.Name), doc)
+	err = s.KvService.PutBinaryWithStringKey(CATALOG, fmt.Sprintf("db:%s", s.Name), doc)
 
 	if err != nil {
 		return fmt.Errorf("failed to write db catalog entry")
@@ -108,7 +109,7 @@ func (s *GDBService) CreateCollection(collection_name string) error {
 		Ns: fmt.Sprintf("%s.%s", s.Name, collection_name),
 		// The wiredtiger table where the collection's document
 		TableUri:       collectionTableUri,
-		VectorIndexUri: fmt.Sprintf("%s_%s", collection_name, ".index"),
+		VectorIndexUri: fmt.Sprintf("%s%s", collection_name, ".index"),
 		CreatedAt:      primitive.NewDateTimeFromTime(time.Now()),
 		UpdatedAt:      primitive.NewDateTimeFromTime(time.Now()),
 	}
@@ -116,6 +117,7 @@ func (s *GDBService) CreateCollection(collection_name string) error {
 	err = s.KvService.CreateTable(collectionTableUri, "key_format=u,value_format=u")
 	if err != nil {
 		fmt.Printf("[GDBSERVICE:CreateCollection:Goroutine] Failed to create table %s: %v\n", collectionTableUri, err)
+		return fmt.Errorf("[GDBSERVICE:CreateCollection:Goroutine] Failed to create table %s: %v", collectionTableUri, err)
 	}
 
 	doc, err := bson.Marshal(catalogEntry)
@@ -124,7 +126,7 @@ func (s *GDBService) CreateCollection(collection_name string) error {
 		return fmt.Errorf("[GDBSERVICE:CreateCollection]: Failed to encode catalog entry")
 	}
 
-	err = kv.PutBinaryWithStringKey(CATALOG_TABLE_URI, fmt.Sprintf("%s.%s", s.Name, collection_name), doc)
+	err = kv.PutBinaryWithStringKey(CATALOG, fmt.Sprintf("%s.%s", s.Name, collection_name), doc)
 
 	// STATS
 	// Create entry in hot stats table
@@ -139,7 +141,7 @@ func (s *GDBService) CreateCollection(collection_name string) error {
 		return fmt.Errorf("[GDBSERVICE:CreateCollection]: Failed to encode catalog entry")
 	}
 
-	err = kv.PutBinaryWithStringKey(STATS_TABLE_URI, fmt.Sprintf("%s.%s", s.Name, collection_name), stats_doc)
+	err = kv.PutBinaryWithStringKey(STATS, fmt.Sprintf("%s.%s", s.Name, collection_name), stats_doc)
 
 	if err != nil {
 		return fmt.Errorf("failed to write db catalog entry")
@@ -153,11 +155,10 @@ func (s *GDBService) InsertDocumentsIntoCollection(collection_name string, docum
 	vectr := faiss.FAISS()
 
 	collectionDefKey := fmt.Sprintf("%s.%s", s.Name, collection_name)
-
-	val, exists, err := kv.GetBinary(CATALOG_TABLE_URI, []byte(collectionDefKey))
+	val, exists, err := kv.GetBinary(CATALOG, []byte(collectionDefKey))
 
 	if !exists {
-		return fmt.Errorf("collection could not be found in the db")
+		return fmt.Errorf("collection:%s could not be found in the db", collection_name)
 	}
 
 	if err != nil {
@@ -181,34 +182,19 @@ func (s *GDBService) InsertDocumentsIntoCollection(collection_name string, docum
 	idx, err := vectr.ReadIndex(filePath)
 
 	if err != nil {
-		const dim = 1536 // TODO: ensure correct embedding dimension
 		const indexDesc = "Flat"
-		idx, err = vectr.IndexFactory(dim, indexDesc, faiss.MetricL2)
+		idx, err = vectr.IndexFactory(len(documents[0].Embedding), indexDesc, faiss.MetricL2)
 		if err != nil {
-			return fmt.Errorf("failed to create new IVF index for collection: %v (after failing to load old: %w)", err, err)
+			return fmt.Errorf("failed to create new vector index for collection: %v (after failing to load old: %w)", err, err)
 		}
-		// Train index with a slice of the first few document embeddings.
-		numTrain := 1 // For IVF12, train with the first 12 documents if available
-		if len(documents) < numTrain {
-			return fmt.Errorf("cannot train IVF index: number of documents (%d) is less than the number of clusters (%d)", len(documents), numTrain)
-		}
-		trainData := make([]float32, 0, dim*numTrain)
-		for i := 0; i < numTrain; i++ {
-			doc := documents[i]
-			if len(doc.Embedding) != dim {
-				return fmt.Errorf("embedding dim mismatch: got %d, want %d", len(doc.Embedding), dim)
-			}
-			trainData = append(trainData, doc.Embedding...)
-		}
-		if err := idx.Train(trainData, numTrain); err != nil {
-			return fmt.Errorf("failed to train new IVF index: %v", err)
-		}
+
 		if writeErr := idx.WriteToFile(filePath); writeErr != nil {
 			return fmt.Errorf("failed to persist new IVF index to %s: %v", filePath, writeErr)
 		}
+		//return fmt.Errorf("unable to read vector index index from file path:%s", filePath)
 	}
 
-	hot_stats, _, err := kv.GetBinary(STATS_TABLE_URI, []byte(collectionDefKey))
+	hot_stats, _, err := kv.GetBinary(STATS, []byte(collectionDefKey))
 
 	if err != nil {
 		return fmt.Errorf("failed to fetch hot stats:%s", err)
@@ -223,23 +209,34 @@ func (s *GDBService) InsertDocumentsIntoCollection(collection_name string, docum
 
 	destTableURI := collection.TableUri
 
-	for index, doc := range documents {
+	for _, doc := range documents {
 		doc_bytes, err := bson.Marshal(doc)
 		if err != nil {
 			return fmt.Errorf("failed to marshal document to BSON: %v", err)
 		}
 		key := doc._Id[:]
 
-		fmt.Printf("Inserting document %d with key bytes: %x\n", index, key)
-
 		if err := s.KvService.PutBinary(destTableURI, key, doc_bytes); err != nil {
 			return fmt.Errorf("failed to insert document with _id %s: %v", doc._Id.Hex(), err)
 		}
 
 		err = idx.Add(doc.Embedding, 1)
+		var label int64 = -1
 		if err != nil {
 			return fmt.Errorf("failed to add embedding to index for _id %s: %v", doc._Id.Hex(), err)
 		}
+
+		if nTotal, nErr := idx.NTotal(); nErr == nil {
+			label = nTotal - 1
+		}
+
+		docIDHex := fmt.Sprintf("%x", key)
+		err = s.KvService.PutString(LABELS_TO_DOC_ID_MAPPING_TABLE_URI, fmt.Sprintf("%d", label), docIDHex)
+
+		if err != nil {
+			return fmt.Errorf("failed to write label->docID mapping to table: %v", err)
+		}
+
 		hot_stats_doc.Doc_Count += 1
 	}
 
@@ -256,7 +253,7 @@ func (s *GDBService) InsertDocumentsIntoCollection(collection_name string, docum
 	if err != nil {
 		return fmt.Errorf("failed to marshal hot stats during write")
 	}
-	err = kv.PutBinary(STATS_TABLE_URI, []byte(collectionDefKey), bytes)
+	err = kv.PutBinary(STATS, []byte(collectionDefKey), bytes)
 
 	if err != nil {
 		return fmt.Errorf("failed to write hot stats: %s", err)
@@ -273,6 +270,132 @@ func (s *GDBService) ListCollections() error {
 	return nil
 }
 
+func (s *GDBService) QueryCollection(collection_name string, query QueryStruct) ([]GlowstickDocument, error) {
+	kv := s.KvService
+	vectr_svc := faiss.FAISS()
+
+	docs := []GlowstickDocument{}
+
+	collectionDefKey := fmt.Sprintf("%s.%s", s.Name, collection_name)
+
+	val, exists, err := kv.GetBinary(CATALOG, []byte(collectionDefKey))
+
+	if !exists {
+		return nil, fmt.Errorf("[DB_SERVICE:QueryCollection] - collection could not be found in the db")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	var collection CollectionCatalogEntry
+
+	bson.Unmarshal(val, &collection)
+
+	vectorIndexUri := collection.VectorIndexUri
+
+	var filePath string
+
+	u, err := url.Parse(vectorIndexUri)
+	if err != nil {
+		return nil, fmt.Errorf("[DB_SERVICE:QueryCollection] - failed to parse vector index URI: %v", err)
+	}
+	filePath = u.Path
+
+	idx, err := vectr_svc.ReadIndex(filePath)
+
+	if err != nil {
+		return nil, fmt.Errorf("could not vector index after specfied file path")
+	}
+
+	distances, ids, err := idx.Search(query.QueryEmbedding, 1, int(query.TopK))
+
+	if err != nil {
+		return nil, fmt.Errorf("[DB_SERVICE:QueryCollection] - failed to search vector index for query embedding")
+	}
+
+	indices := make([]int, len(distances))
+	for i := range indices {
+		indices[i] = i
+	}
+
+	sort.Slice(indices, func(i, j int) bool {
+		return distances[indices[i]] < distances[indices[j]]
+	})
+
+	var lastErr error = err
+	for _, index := range indices {
+		id := ids[index]
+		distance := distances[index]
+
+		// id could be -1 if FAISS returned a "no result"; handle this
+		if id < 0 {
+			continue
+		}
+
+		key := fmt.Sprintf("%d", id)
+		val, _, err := kv.GetString(LABELS_TO_DOC_ID_MAPPING_TABLE_URI, key)
+		if err != nil {
+			fmt.Printf("Failed to get docID for label %s: %v\n", key, err)
+			lastErr = err
+			continue
+		}
+
+		if len(val) != 24 {
+			fmt.Printf("Invalid ObjectID hex length: expected 24, got %d for '%s'\n", len(val), val)
+			lastErr = fmt.Errorf("invalid ObjectID hex length: expected 24, got %d for '%s'", len(val), val)
+			continue
+		}
+
+		objectID, err := primitive.ObjectIDFromHex(val)
+		if err != nil {
+			fmt.Printf("Failed to parse docID '%s' as ObjectID hex: %v\n", val, err)
+			lastErr = err
+			continue
+		}
+
+		// Validate the ObjectID is not empty/zero
+		if objectID.IsZero() {
+			fmt.Printf("ObjectID is zero/empty for hex '%s'\n", val)
+			lastErr = fmt.Errorf("ObjectID is zero/empty for hex '%s'", val)
+			continue
+		}
+
+		docIDBytes := objectID[:] // Convert ObjectID to raw [12]byte slice
+		if len(docIDBytes) != 12 {
+			fmt.Printf("Invalid docIDBytes length: expected 12, got %d\n", len(docIDBytes))
+			lastErr = fmt.Errorf("invalid docIDBytes length: expected 12, got %d", len(docIDBytes))
+			continue
+		}
+
+		docBin, _, err := kv.GetBinary(collection.TableUri, docIDBytes)
+		if err != nil {
+			fmt.Printf("Failed to get document for docID %s in table %s: %v\n", val, collection.TableUri, err)
+			lastErr = err
+			continue
+		}
+		if len(docBin) > 0 {
+			var doc GlowstickDocument
+
+			if err := bson.Unmarshal(docBin, &doc); err != nil {
+				fmt.Printf("Failed to unmarshal BSON for docID %s: %v\n", val, err)
+				lastErr = err
+				continue
+			}
+
+			fmt.Printf("DocID: %s, Distance: %f\n", val, distance)
+
+			if query.MinDistance == 0 || distance < query.MinDistance {
+				docs = append(docs, doc)
+			} else {
+				fmt.Printf("DocID: %s, skipped\n", val)
+			}
+		}
+	}
+
+	return docs, lastErr
+}
+
 func InitTablesHelper(wtService wt.WTService) error {
 	if _, err := os.Stat("volumes/WT_HOME"); os.IsNotExist(err) {
 		if mkErr := os.MkdirAll("volumes/WT_HOME", 0755); mkErr != nil {
@@ -280,12 +403,16 @@ func InitTablesHelper(wtService wt.WTService) error {
 		}
 	}
 
-	if err := wtService.CreateTable(CATALOG_TABLE_URI, "key_format=u,value_format=u"); err != nil {
+	if err := wtService.CreateTable(CATALOG, "key_format=u,value_format=u"); err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
 	}
 
-	if err := wtService.CreateTable(STATS_TABLE_URI, "key_format=u,value_format=u"); err != nil {
+	if err := wtService.CreateTable(STATS, "key_format=u,value_format=u"); err != nil {
 		return fmt.Errorf("failed to create table: %w", err)
+	}
+
+	if err := wtService.CreateTable(LABELS_TO_DOC_ID_MAPPING_TABLE_URI, "key_format=S,value_format=S"); err != nil {
+		return fmt.Errorf("failed to create table: %v", err)
 	}
 
 	return nil

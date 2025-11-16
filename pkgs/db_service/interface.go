@@ -6,8 +6,10 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-var CATALOG_TABLE_URI = "table:_catalog"
-var STATS_TABLE_URI = "table:_stats"
+// TABLE URIS for creating wiredtiger tables
+var CATALOG = "table:_catalog"
+var STATS = "table:_stats"
+var LABELS_TO_DOC_ID_MAPPING_TABLE_URI = "table:label_docID"
 
 type GlowstickDocument struct {
 	_Id       primitive.ObjectID `bson:"_id"`
@@ -16,11 +18,19 @@ type GlowstickDocument struct {
 	Metadata  interface{}        `bson:"metadata"` // Any BSON- and JSON-serializable type
 }
 
+type QueryStruct struct {
+	TopK           int32
+	MinDistance    float32
+	QueryEmbedding []float32
+	Filters        map[string]interface{}
+}
+
 type DBService interface {
 	CreateDB() error
 	DeleteDB(name string) error
 	CreateCollection(collection_name string) error
 	InsertDocumentsIntoCollection(collection_name string, documents []GlowstickDocument) error
+	QueryCollection(collection_name string, query QueryStruct) ([]GlowstickDocument, error)
 	ListCollections() error
 }
 

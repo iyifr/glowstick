@@ -46,7 +46,7 @@ func TestCreateDb(t *testing.T) {
 	// Create the db
 	dbSvc.CreateDB()
 
-	val, key_exists, err := wtService.GetBinaryWithStringKey(CATALOG_TABLE_URI, fmt.Sprintf("db:%s", name))
+	val, key_exists, err := wtService.GetBinaryWithStringKey(CATALOG, fmt.Sprintf("db:%s", name))
 
 	if !key_exists {
 		t.Errorf("DB value not persisted.")
@@ -125,7 +125,7 @@ func TestCreateCollection(t *testing.T) {
 
 	fmt.Printf("URI: %s\n", fmt.Sprintf("%s.%s", dbName, collName))
 
-	val, key_exists, err := wtService.GetBinaryWithStringKey(CATALOG_TABLE_URI, fmt.Sprintf("%s.%s", dbName, collName))
+	val, key_exists, err := wtService.GetBinaryWithStringKey(CATALOG, fmt.Sprintf("%s.%s", dbName, collName))
 
 	if !key_exists {
 		t.Errorf("DB value not persisted.")
@@ -219,7 +219,7 @@ func TestInsertDocuments(t *testing.T) {
 	}
 
 	collectionDefKey := fmt.Sprintf("%s.%s", dbName, collName)
-	val, exists, err := wtService.GetBinary(CATALOG_TABLE_URI, []byte(collectionDefKey))
+	val, exists, err := wtService.GetBinary(CATALOG, []byte(collectionDefKey))
 	if err != nil {
 		t.Fatalf("failed to get collection catalog entry from _catalog: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestInsertDocuments(t *testing.T) {
 		}
 	}
 
-	statsVal, statsExists, statsErr := wtService.GetBinary(STATS_TABLE_URI, []byte(collectionDefKey))
+	statsVal, statsExists, statsErr := wtService.GetBinary(STATS, []byte(collectionDefKey))
 	if statsErr != nil {
 		t.Errorf("Failed to retrieve _stats entry for collection %s: %v", collName, statsErr)
 	}
@@ -269,12 +269,82 @@ func TestInsertDocuments(t *testing.T) {
 	if statsErr == nil && statsExists {
 		if err := bson.Unmarshal(statsVal, &hotStats); err != nil {
 			t.Errorf("Unmarshal failed for hot stats: %v", err)
-		} else if int(hotStats.Doc_Count) != len(documents) {
+		}
+
+		if int(hotStats.Doc_Count) != len(documents) {
 			t.Logf("hot stats: %f", hotStats.Vector_Index_Size)
 			t.Errorf("Stats Doc_Count mismatch, got %d, want %d", hotStats.Doc_Count, len(documents))
 		}
 	}
 
+}
+
+func TestBasicVectorQuery(t *testing.T) {
+	wtService := wiredtiger.WiredTiger()
+
+	if _, err := os.Stat(WIREDTIGER_DIR); os.IsNotExist(err) {
+		if mkErr := os.MkdirAll(WIREDTIGER_DIR, 0755); mkErr != nil {
+			t.Fatalf("failed to create WT_HOME_TEST dir: %v", mkErr)
+		}
+	}
+
+	if err := wtService.Open(WIREDTIGER_DIR, "create"); err != nil {
+		t.Log("Err occured")
+	}
+
+	defer func() {
+		if err := wtService.Close(); err != nil {
+			fmt.Printf("Warning: failed to close connection: %v\n", err)
+		}
+		// os.RemoveAll("volumes/WT_HOME_TEST")
+	}()
+
+	dbName := "default"
+	collName := "tenant_id_1"
+
+	params := DbParams{
+		Name:      dbName,
+		KvService: wtService,
+	}
+
+	dbSvc := DatabaseService(params)
+
+	// Create the db
+	err := dbSvc.CreateDB()
+	if err != nil {
+		t.Errorf("Failed to create Db; %s", err)
+	}
+
+	err = dbSvc.CreateCollection(collName)
+	if err != nil {
+		t.Errorf("Failed to create collection: %s", err)
+	}
+
+	documents := []GlowstickDocument{
+		{
+			_Id:       primitive.NewObjectID(),
+			Content:   "First example document",
+			Embedding: genEmbeddings(1536),
+			Metadata:  map[string]interface{}{"type": "example", "index": 1},
+		},
+		{
+			_Id:       primitive.NewObjectID(),
+			Content:   "Second example document",
+			Embedding: genEmbeddings(1536),
+			Metadata:  map[string]interface{}{"type": "example", "index": 2},
+		},
+		{
+			_Id:       primitive.NewObjectID(),
+			Content:   "Third example document",
+			Embedding: genEmbeddings(1536),
+			Metadata:  map[string]interface{}{"type": "example", "index": 3},
+		},
+	}
+
+	err = dbSvc.InsertDocumentsIntoCollection(collName, documents)
+	if err != nil {
+		t.Errorf("InsertDocumentsIntoCollection returned error: %v", err)
+	}
 }
 
 func genEmbeddings(dim int) []float32 {
